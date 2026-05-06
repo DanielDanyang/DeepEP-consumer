@@ -6,6 +6,17 @@
 
 namespace deep_ep::jit {
 
+/*
+ * 当前 CUDA device 的属性缓存。
+ *
+ * v2 host 调度会反复查询:
+ *
+ *     clock rate       -> GPU timeout seconds -> cycles
+ *     shared memory    -> 每 SM 可放多少 TMA token staging buffer
+ *     SM count         -> 自动 SM 数上限、full-SM epilogue grid
+ *     arch string      -> nvcc --gpu-architecture=sm_*
+ */
+
 class DeviceRuntime {
     int64_t cached_clock_rate = 0;
     std::shared_ptr<cudaDeviceProp> cached_prop;
@@ -24,7 +35,7 @@ class DeviceRuntime {
 public:
     int64_t get_clock_rate() {
         if (cached_clock_rate == 0) {
-            // NOTES: we should convert kHz into Hz
+            // cudaDevAttrClockRate 单位是 kHz，kernel timeout 使用 cycles，需要换成 Hz。
             int device_idx, rate;
             CUDA_RUNTIME_CHECK(cudaGetDevice(&device_idx));
             CUDA_RUNTIME_CHECK(cudaDeviceGetAttribute(&rate, cudaDevAttrClockRate, device_idx));
@@ -48,6 +59,7 @@ public:
 
     std::string get_arch(const bool& number_only = false,
                          const bool& support_arch_family = false) {
+        // SM100 非 10.1 设备需要 family suffix；老 NVCC 不认识 100f 时退到 100a。
         const auto [major, minor] = get_arch_pair();
         if (major == 10 and minor != 1) {
             if (number_only)

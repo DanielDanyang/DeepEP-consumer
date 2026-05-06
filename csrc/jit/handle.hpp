@@ -8,6 +8,25 @@
 
 namespace deep_ep::jit {
 
+/*
+ * CUDA runtime/driver API 抽象层。
+ *
+ * 根据编译环境选择:
+ *
+ *   CUDA runtime API (cudaLibrary/cudaKernel)
+ *     条件: CUDA >= 12.8 且 EP_JIT_USE_RUNTIME_API
+ *
+ *   CUDA driver API (CUmodule/CUfunction)
+ *     默认路径，支持 cooperative launch、cluster dim、PDL attribute
+ *
+ * 上层只看到:
+ *
+ *     load_kernel(cubin, func_name)
+ *     construct_launch_config(...)
+ *     launch_kernel(kernel, config, args...)
+ *     unload_library(...)
+ */
+
 #if CUDART_VERSION >= 12080 and defined(EP_JIT_USE_RUNTIME_API)
 
 // Use CUDA runtime API
@@ -118,14 +137,14 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.attrs = attrs;
     config.numAttrs = 0;
 
-    // Cooperative launch
+    // cooperative launch 允许 kernel 内 cooperative_groups::this_grid().sync()。
     if (cooperative) {
         auto& attr = attrs[config.numAttrs ++];
         attr.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
         attr.value.cooperative = 1;
     }
 
-    // Cluster size
+    // cluster dim 让 kernel 和 clustered compute 更容易 overlap/调度。
     // NOTES: must use `static` or the `attr` will be deconstructed
     if (cluster_dim > 1) {
         auto& attr = attrs[config.numAttrs ++];
@@ -135,7 +154,8 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
         attr.value.clusterDim.z = 1;
     }
 
-    // Dependent kernel launch
+    // Programmatic Dependent Launch: main kernel 通过 cudaTriggerProgrammaticLaunchCompletion()
+    // 允许 epilogue 在同 stream 上依赖式启动。
     if (enable_pdl) {
         auto& attr = attrs[config.numAttrs ++];
         attr.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;

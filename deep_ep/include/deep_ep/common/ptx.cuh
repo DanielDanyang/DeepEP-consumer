@@ -7,6 +7,36 @@
 
 namespace deep_ep::elastic::ptx {
 
+/*
+ * PTX/TMA/warp intrinsic 工具层。
+ *
+ * 这一层把 v2 kernel 中频繁出现的底层指令封装成小函数:
+ *
+ *   TMA:
+ *     mbarrier_init / tma_load_1d / tma_store_1d / store_commit / store_wait
+ *
+ *   memory ordering:
+ *     acquire/release/sys load-store, red_add_rel_sys, fence_acq_rel_sys
+ *
+ *   warp collectives:
+ *     elect_one_sync / gather / match / deduplicate / exchange / warp_inclusive_sum
+ *
+ *   vector loads:
+ *     predicated ldg/ld for int4 and longlong4_t
+ *
+ * TMA staging 模式:
+ *
+ *     global memory
+ *          |
+ *          | tma_load_1d + mbarrier
+ *          v
+ *     shared-memory token slot
+ *          |
+ *          | tma_store_1d + commit/wait
+ *          v
+ *     peer/global destination
+ */
+
 // Host-side placeholder with the same size/alignment as cuda::barrier<thread_scope_block>
 // (a single uint64_t atomic), so that sizeof(mbarrier) is consistent across host and device.
 struct alignas(8) mbarrier { uint64_t __placeholder; };
@@ -35,6 +65,7 @@ __forceinline__ __device__ int get_lane_idx() {
 
 /// Election
 __forceinline__ __device__ int elect_one_sync() {
+    // 在一个 warp 内选出一个 lane 作为 leader。SM90 用 elect.sync，旧架构退化为 lane0。
 #ifndef DISABLE_SM90_FEATURES
     int pred = 0;
     asm volatile(
@@ -54,6 +85,7 @@ __forceinline__ __device__ int elect_one_sync() {
 
 /// TMA and `cp.async`
 __forceinline__ __device__ void mbarrier_init_with_fence(mbarrier* ptr, const int& arrive_count = 1) {
+    // TMA load 的完成由 mbarrier 追踪；init 后的 fence 确保 barrier 状态对 CTA 可见。
     asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::
                  "r"(arrive_count), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
     asm volatile("fence.mbarrier_init.release.cluster;" ::);
@@ -135,6 +167,7 @@ __forceinline__ __device__ void tma_store_commit() {
 
 template <class dtype_t>
 __forceinline__ __device__ void cp_async_ca(const dtype_t* gmem_src, const dtype_t* smem_dst) {
+    // 小块 scale-factor 拷贝比完整 TMA 更轻，用 cp.async.ca 放进同一个 mbarrier pipeline。
     EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8 or sizeof(dtype_t) == 16, "Invalid dtype bytes");
     asm volatile("cp.async.ca.shared::cta.global.L2::128B [%0], [%1], %2;\n" ::
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst))),
@@ -150,12 +183,14 @@ __forceinline__ __device__ void cp_async_mbarrier_arrive(mbarrier* ptr) {
 /// Barriers
 template <int kNumThreads>
 __forceinline__ __device__ void named_barrier(const int& idx) {
+    // 用于同一 CTA 中不同 warp role 的局部同步，例如 notify warps 的计数规约。
     // Equivalent to `barrier.sync.aligned`, which requires all threads run the same location of code
     asm volatile("bar.sync %0, %1;" ::"r"(idx), "r"(kNumThreads));
 }
 
 /// LD/ST instructions
 __forceinline__ __device__ int4 ldg_with_gez_pred(const int4* ptr, const int& value, const TMACacheHint& cache_hint = TMACacheHint::kEvictFirst) {
+    // predicated load: value < 0 时返回零，combine_reduce 用它避免无效 top-k slot 分支。
     int4 ret = make_int4(0, 0, 0, 0);
     asm volatile(
         "{\n\t"
@@ -271,6 +306,7 @@ __forceinline__ __device__ void red_add_rel_sys(const int64_t* ptr, const int64_
 
 template <typename dtype_t>
 __forceinline__ __device__ dtype_t ld_acquire_sys(const dtype_t* ptr) {
+    // 读取 peer 发布的 tail/count/signal；acquire + sys scope 保证之后能看到对端数据写入。
     if constexpr (sizeof(dtype_t) == 4) {
         uint32_t value;
         asm volatile("ld.acquire.sys.L1::no_allocate.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
@@ -299,6 +335,7 @@ __forceinline__ __device__ void st_relaxed_sys(void* ptr, dtype_t value) {
 
 template <typename dtype_t>
 __forceinline__ __device__ void st_release_sys(void* ptr, dtype_t value) {
+    // 发布 tail/count/signal；release + sys scope 保证之前的 TMA/global stores 先对 peer 可见。
     if constexpr (sizeof(dtype_t) == 4) {
         uint32_t int_value = reinterpret_cast<const uint32_t&>(value);
         asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(ptr), "r"(int_value));
@@ -391,6 +428,7 @@ __device__ __forceinline__ int get_master_lane_idx(const unsigned& mask) {
 }
 
 __device__ __forceinline__ bool deduplicate(const int& value, const int& lane_idx) {
+    // 同一 token 的多个 top-k 可能落到同一 rank；只让最高 lane 代表该 rank 发一次消息。
     return get_master_lane_idx(match(value)) == lane_idx;
 }
 

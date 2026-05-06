@@ -11,6 +11,36 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Dispatch JIT wrapper。
+ *
+ * 这层把 C++ runtime 的动态参数拆成两类:
+ *
+ *   compile-time template args:
+ *       topology, hidden bytes, topk, num_sms, num_qps, expert_alignment,
+ *       cached/deterministic/do_cpu_sync, direct/hybrid mode
+ *
+ *   runtime kernel params:
+ *       tensor pointers, nccl handles, workspace/buffer pointers, rank index,
+ *       token count, scale-factor strides
+ *
+ * JIT 生成路径:
+ *
+ *     launch_dispatch(...)
+ *          |
+ *          v
+ *     DispatchRuntime::generate_impl(args)
+ *          |
+ *          +-- direct: include <deep_ep/impls/dispatch.cuh>
+ *          +-- hybrid: include <deep_ep/impls/hybrid_dispatch.cuh>
+ *          |
+ *          v
+ *     jit::compiler->build("dispatch", code)
+ *          |
+ *          v
+ *     DispatchRuntime::launch_impl(...)
+ */
+
 class DispatchPrologueRuntime final : public jit::LaunchRuntime<DispatchPrologueRuntime> {
 public:
     struct Args {
@@ -31,6 +61,8 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        // deterministic prologue 的目标是预先为每个 token/top-k 计算稳定的目标 slot。
+        // 这样后续 dispatch main kernel 可以复用 dst_buffer_slot_idx，避免 atomic 顺序变化。
         return fmt::format(R"(
 #include <deep_ep/impls/dispatch_deterministic_prologue.cuh>
 
@@ -67,6 +99,11 @@ static void launch_dispatch_deterministic_prologue(topk_idx_t* topk_idx, int* ra
                                                    const at::cuda::CUDAStream& stream) {
     constexpr auto num_warps = 8;
     constexpr auto num_threads = num_warps * 32;
+    // shared memory 布局:
+    //
+    //     rank_count_global_psum[num_ranks]
+    //     rank_count_warp_sum[num_warps][num_ranks]
+    //     rank_count_warp_psum[num_warps][num_ranks]
     EP_HOST_ASSERT((2 * num_warps + 1) * num_ranks * sizeof(int) <= num_smem_bytes and
                    "Insufficient shared memory");
 
@@ -126,6 +163,7 @@ public:
     static std::string generate_impl(const Args& args) {
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
+            // direct path: 一个逻辑 scale-up 域内直接写 peer recv buffer；必要时走 RDMA send buffer。
             header_name = "dispatch";
             func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.is_scaleup_nvlink,
@@ -139,6 +177,8 @@ public:
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles);
         } else {
+            // hybrid path: scale-out sender warps 先跨 RDMA 送到目标节点，再由 forward warps
+            // 转发到节点内 scale-up peers。
             header_name = "hybrid_dispatch";
             func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
@@ -203,6 +243,7 @@ static void __instantiate_kernel() {{
 constexpr int kNumNotifyWarps = 4;
 
 static int get_num_notify_smem_bytes(const int& num_ranks, const int& num_experts) {
+    // notify warps 在 shared memory 里暂存 rank/expert 计数，再规约到 workspace。
     return math::align(num_ranks + num_experts, kNumNotifyWarps * 32) * sizeof(int);
 }
 
@@ -236,14 +277,22 @@ static void launch_dispatch(void* x, void* sf,
                             const bool& deterministic,
                             const bool& do_cpu_sync,
                             const at::cuda::CUDAStream& stream) {
-    // Cached mode does not support expert token counting
+    // cached mode 跳过 notify/count，所以不能顺手更新 cumulative_local_expert_recv_stats。
     if (cached_mode)
         EP_HOST_ASSERT(cumulative_local_expert_recv_stats == nullptr);
 
     // Utils
     const auto num_ranks = num_scaleout_ranks * num_scaleup_ranks;
 
-    // Notify warps
+    // warp role 分配:
+    //
+    // direct:
+    //     [notify warps][dispatch warps]
+    //
+    // hybrid:
+    //     [notify warps][scaleout sender warps][forward warps]
+    //
+    // cached mode 没有 notify warps，因为所有 count/slot metadata 都从 handle 复用。
     // TODO: why don't we use 4 notify warps?
     const int num_notify_warps = cached_mode ? 0 : kNumNotifyWarps;
     const bool reuse_slot_indices = cached_mode or deterministic;
@@ -255,7 +304,7 @@ static void launch_dispatch(void* x, void* sf,
     int num_scaleout_warps = 0, num_forward_warps = 0;
     int num_threads = 0;
 
-    // Maximize shared memory utilization
+    // 根据 token_layout 计算每个 SM 最多能放多少 warp 的 TMA staging buffer。
     if (num_scaleout_ranks == 1) {
         // Too many warps may cause performance degrade, so we limit the total warps into 512
         const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
@@ -334,6 +383,10 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        // epilogue 和 main dispatch 分离，是为了:
+        //   1. main kernel 可以专注通信和 arrival barrier
+        //   2. host 能在知道 num_recv_tokens 后再分配精确大小 recv_x
+        //   3. epilogue 可用全 SM 做 communication buffer -> tensor 的整理
         return fmt::format(R"(
 #include <deep_ep/impls/dispatch_copy_epilogue.cuh>
 
@@ -382,7 +435,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
                                           const at::cuda::CUDAStream& stream) {
-    // Maximize shared memory utilization
+    // epilogue 每个 warp 需要一个完整 token slot 的 TMA staging buffer。
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
     const auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
     const auto num_threads = num_warps * 32;

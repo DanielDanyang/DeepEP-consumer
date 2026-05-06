@@ -2,6 +2,23 @@
 
 namespace deep_ep::elastic::math {
 
+/*
+ * host/device 都可用的小型数学与指针工具。
+ *
+ * 在 v2 kernel 中这些函数主要服务三类事情:
+ *
+ *     alignment:
+ *       token slot / TMA / LDG.256 都要求 16B 或 32B 对齐
+ *
+ *     encoded positive counters:
+ *       writer: encode_decode_positive(count)  -> 负数
+ *       reader: encode_decode_positive(value)  -> 原 count
+ *       ready:  decoded >= 0
+ *
+ *     pointer arithmetic:
+ *       void* base + byte offset -> typed pointer
+ */
+
 template <typename T>
 __forceinline__ __device__ __host__ T ceil_div(T a, T b) {
     return (a + b - 1) / b;
@@ -24,11 +41,13 @@ __forceinline__ __device__ __host__ constexpr T constexpr_align(T a, T b) {
 
 template <typename dtype_t>
 __forceinline__ __device__ __host__ bool is_decoded_positive_ready(const dtype_t& value) {
+    // counter 被写入前保持负编码状态；decode 后 >=0 表示对端已发布真实 count。
     return value >= 0;
 }
 
 template <typename dtype_t>
 __forceinline__ __device__ __host__ dtype_t encode_decode_positive(const dtype_t& value) {
+    // 同一个函数用于 encode 和 decode，因为 -(-x-1)-1 == x。
     return -value - static_cast<dtype_t>(1);
 }
 

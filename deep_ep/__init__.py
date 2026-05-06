@@ -1,3 +1,21 @@
+"""
+DeepEP Python 包入口。
+
+v2 / ElasticBuffer 在 import deep_ep 时需要先初始化 JIT:
+
+    import deep_ep
+        |
+        +-- check_nccl_so()
+        |     确认 PyTorch 已加载 NCCL 与 DeepEP 链接 NCCL 是同一份库
+        |
+        +-- init_jit()
+        |     把 deep_ep/include、CUDA_HOME、NCCL root 传给 C++ JIT runtime
+        |
+        +-- from .buffers.elastic import ElasticBuffer
+
+如果只阅读 v2 通信主线，下一站是 deep_ep/buffers/elastic.py。
+"""
+
 import filecmp
 import functools
 import glob
@@ -75,6 +93,10 @@ def init_jit():
     # noinspection PyUnresolvedReferences
     import deep_ep._C as _C
     library_root_path = os.path.dirname(os.path.abspath(__file__))
+    # C++ JIT 需要这三个根路径才能:
+    #   - 找到 <deep_ep/impls/*.cuh>
+    #   - 调用 nvcc/cuobjdump
+    #   - include NCCL device Gin headers
     _C.init_jit(library_root_path,  # Library root directory path
                 find_cuda_home(),   # CUDA home
                 find_nccl_root())   # NCCL root

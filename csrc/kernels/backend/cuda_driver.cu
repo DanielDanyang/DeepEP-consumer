@@ -9,6 +9,17 @@
 
 namespace deep_ep::cuda_driver {
 
+/*
+ * CUDA driver batched memory ops。
+ *
+ * host 侧需要在 CUDA stream 上批量执行小型 signal 操作，例如 AGRS session:
+ *
+ *     write my signal to peers
+ *     wait peer signals >= value
+ *
+ * 使用 cuStreamBatchMemOp 可以把多个 write/wait 排进同一 stream，避免 CPU 逐个同步。
+ */
+
 static CUstreamBatchMemOpParams create_mem_op(
     void *ptr, const int& value,
     const CUstreamBatchMemOpType& type,
@@ -29,6 +40,7 @@ static CUstreamBatchMemOpParams create_mem_op(
 }
 
 void batched_write(CUstream stream, const std::vector<void*>& ptrs, const int& value) {
+    // 在 stream 上向多个 device pointer 写同一个 32-bit value。
     std::vector<CUstreamBatchMemOpParams> ops(ptrs.size());
     for (int i = 0; i < ptrs.size(); ++ i)
         ops[i] = create_mem_op(ptrs[i], value, CU_STREAM_MEM_OP_WRITE_VALUE_32);
@@ -36,6 +48,7 @@ void batched_write(CUstream stream, const std::vector<void*>& ptrs, const int& v
 }
 
 void batched_wait(CUstream stream, const std::vector<void*>& ptrs, const int& value) {
+    // 等所有 pointer 的值 >= value；用于 peer completion signal。
     std::vector<CUstreamBatchMemOpParams> ops(ptrs.size());
     for (int i = 0; i < ptrs.size(); ++ i)
         ops[i] = create_mem_op(ptrs[i], value, CU_STREAM_MEM_OP_WAIT_VALUE_32, CU_STREAM_WAIT_VALUE_GEQ);
@@ -43,6 +56,7 @@ void batched_wait(CUstream stream, const std::vector<void*>& ptrs, const int& va
 }
 
 void batched_write_and_wait(CUstream stream, const std::vector<void*>& write_ptrs, const std::vector<void*>& wait_ptrs, const int& value) {
+    // write 和 wait 排在同一个 stream batch 中，保持 stream order。
     std::vector<CUstreamBatchMemOpParams> ops(write_ptrs.size() + wait_ptrs.size());
     for (int i = 0; i < write_ptrs.size(); ++ i)
        ops[i] = create_mem_op(write_ptrs[i], value, CU_STREAM_MEM_OP_WRITE_VALUE_32);

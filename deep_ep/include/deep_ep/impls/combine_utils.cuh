@@ -5,6 +5,28 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * combine 规约公共工具。
+ *
+ * combine main kernel 和 reduce epilogue 都会做类似事情:
+ *
+ *     top-k slots -> load candidate hidden vectors -> reduce -> shared/output buffer
+ *
+ * 本文件提供:
+ *   - layout 选择: 按 rank 维度还是 top-k 维度放 reduce buffer
+ *   - vector 类型: SM100+ 可用 32B longlong4_t，否则 int4
+ *   - top-k slot compaction
+ *   - BF16/FP32 reduce helper
+ *
+ * reduce buffer 维度选择:
+ *
+ *     allow_multiple_reduction=true:
+ *       如果 ranks <= topk，用 rank layout，减少无效 top-k slot
+ *
+ *     allow_multiple_reduction=false:
+ *       保留 top-k layout，让最终 epilogue 做一次集中规约，精度更稳定但通信更多。
+ */
+
 template <bool kAllowMultipleReduction, int kNumRanks, int kNumTopk>
 constexpr bool use_rank_layout() {
     if constexpr (not kAllowMultipleReduction)
@@ -42,6 +64,8 @@ template <int kNumValidTopk, typename fetch_func_t>
 __device__ __forceinline__
 void compute_topk_slots(int (&topk_slot_idx)[kNumValidTopk], uint32_t mask,
                         const fetch_func_t& fetch_func) {
+    // 将 mask 中有效 lane 对应的 slot index 压到数组前部，无效位置填 -1。
+    // 无条件 fetch 是为了减少分支发散。
     #pragma unroll
     for (int k = 0; k < kNumValidTopk; ++ k) {
         const int lowest_idx = __ffs(mask) - 1;
@@ -60,6 +84,13 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
                     const get_src_buffer_ptr_func_t& get_src_buffer_ptr_func,
                     const wait_buffer_func_t& wait_buffer_func,
                     vec_t* bias_0 = nullptr, vec_t* bias_1 = nullptr) {
+    // 每个 warp 负责一个 token 的 hidden 向量规约:
+    //
+    //     lane0..31 处理向量条带
+    //     kUnrollFactor 提高每轮加载/计算吞吐
+    //     wait_buffer_func 在第一次写 shared/output 前释放 TMA staging buffer
+    //
+    // 两路或一路无 bias 时走 BF16 hadd 快路径；否则用 FP32 accumulate 再 cast BF16。
     constexpr int kNumElemsPerVec = sizeof(vec_t) / sizeof(nv_bfloat16);
     EP_STATIC_ASSERT(kNumElemsPerVec % 2 == 0, "Invalid number of elements");
     EP_STATIC_ASSERT(kHiddenVec % (kUnrollFactor * 32) == 0, "Invalid unrolling");

@@ -12,6 +12,29 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Engram fetch JIT wrapper。
+ *
+ * Engram 是实验性的远端 KV/cache fetch primitive。storage 预先写入 ElasticBuffer
+ * 的前缀区域，fetch 根据 global entry index 通过 RDMA get 拉取远端 entry。
+ *
+ * 数据流:
+ *
+ *     storage[rank][entry, hidden]
+ *             ^
+ *             |
+ *     indices[token] = global_entry_idx
+ *             |
+ *             v
+ *     engram_fetch_impl: issue gin.get on QPs
+ *             |
+ *             v
+ *     fetched[token, hidden]  (view 到 buffer 后缀)
+ *             |
+ *             v
+ *     returned hook -> engram_fetch_wait_impl -> wait requests
+ */
+
 class EngramFetchRuntime final : public jit::LaunchRuntime<EngramFetchRuntime> {
 public:
     struct Args {
@@ -69,7 +92,7 @@ static void launch_engram_fetch(const ncclDevComm_t& nccl_dev_comm, const ncclWi
                                 const at::cuda::CUDAStream& stream) {
     constexpr int kNumEngramFetchThreads = 1024;
 
-    // Generate, build and launch
+    // grid_dim = num_qps。每个 QP block 内多个 warp 轮询 token indices 并聚合 RDMA get。
     const EngramFetchRuntime::Args args = {
         .num_entries_per_rank = num_entries_per_rank,
         .hidden = hidden,
@@ -128,7 +151,7 @@ static void launch_engram_fetch_wait(ncclGinRequest_t* last_gin_requests,
                                      const at::cuda::CUDAStream& stream) {
     constexpr int kNumEngramFetchWaitThreads = 1024;
 
-    // Generate, build and launch
+    // wait kernel 与 fetch kernel 使用相同 QP grid，逐 rank 等待最后一次 flushAsync request。
     const EngramFetchWaitRuntime::Args args = {
         .num_ranks = num_ranks,
         .nccl_dev_comm = nccl_dev_comm,

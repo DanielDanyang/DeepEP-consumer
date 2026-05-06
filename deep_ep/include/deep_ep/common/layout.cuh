@@ -7,6 +7,39 @@
 
 namespace deep_ep::elastic::layout {
 
+/*
+ * v2 内存布局核心。
+ *
+ * ElasticBuffer 的 symmetric window 被拆成:
+ *
+ *     window base
+ *       |
+ *       +-- WorkspaceLayout
+ *       |     控制面: barrier / count / prefix / channel tail / PP / AGRS signals
+ *       |
+ *       +-- BufferLayout<TokenLayout>
+ *             数据面: 按 rank 或 channel 切分的 token slots
+ *
+ * Token slot 内部布局:
+ *
+ *     +-------------------------------+  32B aligned
+ *     | hidden payload                 |
+ *     +-------------------------------+
+ *     | optional scale-factor packs    |
+ *     +-------------------------------+
+ *     | metadata                       |
+ *     |   topk_idx[topk]               |
+ *     |   topk_weights[topk]           |
+ *     |   optional src token metadata  |
+ *     +-------------------------------+
+ *     | optional TMA mbarrier          |
+ *     +-------------------------------+
+ *
+ * 读 kernel 时先确认当前使用的是:
+ *     BufferLayout<false>  global communication buffer，无 mbarrier
+ *     BufferLayout<true>   shared-memory staging buffer，末尾带 mbarrier
+ */
+
 struct WorkspaceLayout {
     void* workspace;
 
@@ -14,8 +47,7 @@ struct WorkspaceLayout {
     int num_scaleout_ranks, num_scaleup_ranks;
     int num_experts, num_experts_per_rank;
 
-    // We want to fix the layout position for all settings,
-    // so that one buffer can be reused for all cases
+    // 为了让同一个 ElasticBuffer 跨不同 num_experts/topology 复用，workspace 按最大值固定偏移。
     static constexpr int kNumMaxRanks = 1024;
     static constexpr int kNumMaxExperts = 2048;
     static constexpr int kNumMaxExpertsPerRank = 256;
@@ -41,6 +73,19 @@ struct WorkspaceLayout {
     }
 
     static int64_t get_num_bytes() {
+        // WorkspaceLayout 内存图:
+        //
+        //     base
+        //       +-- NVLink barrier counter/signal
+        //       +-- notify reduction workspace       int64[max_rank + max_expert]
+        //       +-- scale-up send/recv counts        int64[2][rank + expert]
+        //       +-- scale-up atomic sender counters  int[max_rank]
+        //       +-- scale-out send/recv counts       int[2][rank + expert]
+        //       +-- scale-out channel signaled tails int64[max_rank * max_channel]
+        //       +-- channel scale-up tails           int[max_rank * max_channel]
+        //       +-- PP send/recv counters            int64[4]
+        //       +-- AGRS recv/session signals        int[(slots + 1) * max_rank]
+        //       +-- 32B alignment
         // Pure NVLink scaleup barrier signals
         int64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
@@ -81,6 +126,7 @@ struct WorkspaceLayout {
     }
 
     __forceinline__ __device__ __host__ unsigned long long* get_nvl_barrier_counter_ptr() const {
+        // counter 低 2 bits 存 phase/sign；详见 comm::nvlink_barrier_wo_local_sync。
         return static_cast<unsigned long long*>(workspace);
     }
 
@@ -94,6 +140,7 @@ struct WorkspaceLayout {
 
     template <bool kIsSendBuffer>
     __forceinline__ __device__ __host__ int64_t* get_scaleup_rank_expert_count_ptr() const {
+        // scale-up 计数区把 rank counts 放前面，expert counts 紧随其后。
         const auto base_ptr =
             math::advance_ptr<int64_t>(get_notify_reduction_workspace_ptr(), (kNumMaxRanks + kNumMaxExperts) * sizeof(int64_t));
         return base_ptr + (kIsSendBuffer ? 0 : kNumMaxRanks + kNumMaxExperts);
@@ -137,6 +184,7 @@ struct WorkspaceLayout {
 
     __forceinline__ __device__ __host__ int64_t* get_scaleout_channel_signaled_tail_ptr(
         const int& channel_idx, const int& scaleout_rank_idx) const {
+        // hybrid dispatch/combine 用它在 scale-out peers 之间发布每个 channel 的 tail 和 finish flag。
         const auto base_ptr = math::advance_ptr<int64_t>(
             get_scaleout_rank_expert_count_ptr<true>(),
             (kNumMaxRanks + kNumMaxExperts) * sizeof(int) * 2);
@@ -145,6 +193,8 @@ struct WorkspaceLayout {
 
     __forceinline__ __device__ __host__ int* get_channel_scaleup_tail_ptr(
         const int& channel_idx, const int& scaleup_rank_idx) const {
+        // hybrid forward/epilogue 的 per-channel scale-up tail。dispatch 写 linked-list 末尾，
+        // combine 用它等待 scale-up warps 产出。
         const auto base_ptr = math::advance_ptr<int>(
             get_scaleout_channel_signaled_tail_ptr(0, 0),
             kNumMaxRanks * kNumMaxChannels * sizeof(int64_t));
@@ -189,7 +239,9 @@ struct TokenLayout {
                 const int& num_topk, const bool& with_metadata, void* base = nullptr) :
         num_hidden_bytes(num_hidden_bytes),
         num_sf_bytes(num_sf_bytes),
-        // Metadata includes: top-k indices, weight and source rank/token index
+        // metadata =
+        //   topk_idx[topk] + topk_weights[topk]
+        //   + optional dispatch source token global idx and linked-list slot indices
         with_metadata(with_metadata),
         num_topk(num_topk),
         num_metadata_bytes(num_topk * (sizeof(int) + sizeof(float)) +
@@ -201,6 +253,7 @@ struct TokenLayout {
 
     template <bool kWithMBarrier, typename dtype_t = int>
     __forceinline__ __device__ __host__ dtype_t get_num_bytes() const {
+        // 每一段都独立 32B 对齐，方便 TMA 1D copy 和 LDG.256。
         const auto num_bytes = math::align(num_hidden_bytes, ptx::kNumTMAAlignBytes) +
                                math::align(num_sf_bytes, ptx::kNumTMAAlignBytes) +
                                math::align(num_metadata_bytes, ptx::kNumTMAAlignBytes) +
@@ -241,6 +294,7 @@ struct TokenLayout {
     }
 
     __forceinline__ __device__ __host__ int* get_linked_list_idx_ptr() const {
+        // dispatch hybrid forward 会把 per-scaleup linked-list index 临时写在这里。
         return get_src_token_global_idx_ptr() + 1;
     }
 
@@ -288,6 +342,9 @@ struct BufferLayout {
 
     __forceinline__ __device__ __host__
     BufferLayout get_rank_buffer(const int& rank_idx) const {
+        // 以 rank 为第一维切 buffer:
+        //
+        //     rank0 tokens | rank1 tokens | ... | rankN tokens
         return BufferLayout(token_layout,
                             1, num_max_tokens_per_rank,
                             static_cast<int8_t*>(base) + get_num_bytes_per_rank() * rank_idx);
@@ -296,6 +353,8 @@ struct BufferLayout {
     template <int kNumTokensPerChannel>
     __forceinline__ __device__ __host__
     BufferLayout get_channel_buffer(const int& channel_idx) const {
+        // channel view 通过 token stride 偏移进入同一个物理 buffer。
+        // 它不会改变 rank stride，只是让不同 channel 处理不同 token range。
         EP_UNIFIED_ASSERT(num_max_tokens_per_rank % kNumTokensPerChannel == 0);
         return BufferLayout(token_layout,
                             // Do not use `num_max_tokens_per_rank / kNumTokensPerChannel` as the false stride
@@ -305,6 +364,7 @@ struct BufferLayout {
 
     __forceinline__ __device__ __host__
     TokenLayout get_token_buffer(const int& token_idx, const bool& global = false) const {
+        // global=false 时要求当前 BufferLayout 已经被 get_rank_buffer 缩到单 rank。
         EP_UNIFIED_ASSERT(num_ranks == 1 or global);
         return TokenLayout(token_layout.num_hidden_bytes, token_layout.num_sf_bytes, token_layout.num_topk, token_layout.with_metadata,
                            static_cast<int8_t*>(base) + token_layout.get_num_bytes<kWithMBarrier, int64_t>() * token_idx);

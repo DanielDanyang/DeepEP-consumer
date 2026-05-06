@@ -8,6 +8,33 @@
 
 namespace deep_ep::elastic::handle {
 
+/*
+ * NCCL Gin device-side helper。
+ *
+ * v2 device kernel 不直接到处调用 ncclGin API，而是通过 NCCLGin 包一层:
+ *
+ *     kernel warp/channel
+ *          |
+ *          v
+ *     NCCLGin(qp_idx, sharing_mode)
+ *          |
+ *          +-- get_sym_ptr<LSA>    NVLink/LSA symmetric pointer fast path
+ *          +-- put/get<World/Rail> RDMA or world/rail team Gin operation
+ *          +-- red_add_rel         local system atomic 或 remote Gin signal-add
+ *          +-- put_value/signal    control-plane counter/tail publication
+ *
+ * team 语义:
+ *
+ *     ncclTeamTagLsa    local scale-up/NVLink accessible team
+ *     ncclTeamTagRail   same scale-up index across scale-out ranks
+ *     ncclTeamTagWorld  all ranks
+ *
+ * 快路径判断:
+ *
+ *     peer NVLink accessible -> symmetric pointer + PTX system store/atomic
+ *     otherwise              -> NCCL Gin RDMA operation
+ */
+
 struct NCCLGin {
 #define IS_TEAM_WORLD(code) if constexpr (std::is_same_v<team_t, ncclTeamTagWorld>) { code }
 #define IS_TEAM_LSA(code) if constexpr (std::is_same_v<team_t, ncclTeamTagLsa>) { code }
@@ -31,11 +58,13 @@ struct NCCLGin {
         gin(ncclGin(nccl_dev_comm, qp_idx, resource_sharing_mode)),
         team_world(ncclTeamWorld(nccl_dev_comm)), team_lsa(ncclTeamLsa(nccl_dev_comm)), team_rail(ncclTeamRail(nccl_dev_comm)) {
         // TODO: what if we only have 1 NVLink rank
+        // LSA base pointer 是把本 rank symmetric window 指针转换为 peer offset 的基准。
         lsa_base_ptr = reinterpret_cast<uint64_t>(ncclGetLsaPointer(nccl_window, 0, team_lsa.rank));
     }
 
     template <typename team_t>
     __device__ __forceinline__ bool is_nvlink_accessible(const int& dst_rank_idx) const {
+        // 是否能用 symmetric pointer 直接访问 peer。能直连时避免走 RDMA/Gin put。
         IS_TEAM_LSA({
             return true;
         })
@@ -57,6 +86,7 @@ struct NCCLGin {
     template <typename dtype_t = void*>
     __device__ __forceinline__
     uint64_t get_sym_offset(dtype_t* ptr) const {
+        // symmetric window 内偏移 = local pointer - local LSA base。
         return reinterpret_cast<uint64_t>(ptr) - lsa_base_ptr;
     }
 
@@ -64,6 +94,7 @@ struct NCCLGin {
     template <typename team_t, typename dtype_t = void*>
     __device__ __forceinline__
     dtype_t* get_sym_ptr(dtype_t* ptr, const int& dst_rank_idx) const {
+        // 返回 peer rank 上同一 symmetric offset 的地址；不可 NVLink 访问时返回 nullptr。
         IS_TEAM_RAIL({
             return team_rail.rank == dst_rank_idx ? ptr : nullptr;
         })
@@ -97,6 +128,9 @@ struct NCCLGin {
     __device__ __forceinline__
     void red_add_rel(dtype_t* sym_ptr, const dtype_t& value, const int& dst_rank_idx,
                      const int& extra_options = 0) const {
+        // 控制面常用操作:
+        //   - 本地/LSA 可达: release system atomic add
+        //   - 远端: Gin VASignalAdd，语义上等价于对 peer window 的原子加
         const auto dst_ptr = get_sym_ptr<team_t>(sym_ptr, dst_rank_idx);
         // Use symmetric pointers as much as possible, RDMA otherwise
         if (dst_ptr != nullptr) {
@@ -125,6 +159,7 @@ struct NCCLGin {
     __device__ __forceinline__
     void get(void* src_ptr, void* dst_ptr, const int& num_bytes, const int& src_rank_idx,
              const int& extra_options = 0) const {
+        // RDMA get: 从 src_rank 的 symmetric window src_ptr offset 拉到本 rank dst_ptr offset。
         IS_TEAM_WORLD_RAIL({
             gin.get(
                 TEAM_WORLD_RAIL(),
@@ -169,6 +204,7 @@ struct NCCLGin {
     void put(void* recv_sym_ptr, void* send_sym_ptr, const int& num_bytes, const int& dst_rank_idx,
              const int& extra_options = 0,
              const remote_action_t& remote_action = remote_action_t()) const {
+        // RDMA put: 把本 rank send_sym_ptr offset 写到 dst_rank 的 recv_sym_ptr offset。
         // NOTES: local or NVLink put will also go through NIC via this API
         IS_TEAM_WORLD_RAIL({
             gin.put(TEAM_WORLD_RAIL(),
@@ -192,6 +228,7 @@ struct NCCLGin {
     __device__ __forceinline__
     void put_value(dtype_t* sym_ptr, const dtype_t& value, const int& dst_rank_idx,
                    const int& extra_options = 0) const {
+        // 发布小型标量控制信息。可直连时用 system store，否则用 Gin putValue。
         const auto dst_ptr = get_sym_ptr<team_t>(sym_ptr, dst_rank_idx);
         if (dst_ptr != nullptr) {
             ptx::st_relaxed_sys(dst_ptr, value);

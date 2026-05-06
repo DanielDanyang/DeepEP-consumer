@@ -1,3 +1,59 @@
+"""
+DeepEP V2 / ElasticBuffer Python 入口导读。
+
+这层代码负责把用户看到的 MoE 语义整理成 C++ runtime
+能消费的参数，并把 dispatch 产生的路由信息封装成 EPHandle 给 combine 复用。
+
+整体架构:
+
+    user model / MoE layer
+            |
+            v
+    +-----------------------------+
+    | ElasticBuffer.dispatch      |
+    | - 选择 SM / QP              |
+    | - 拆包 FP8 scale factor      |
+    | - 复用或创建 EPHandle       |
+    +--------------+--------------+
+                   |
+                   v
+    +-----------------------------+        JIT wrappers       device kernels
+    | C++ ElasticBuffer runtime   | ----> csrc/kernels ----> impls/*.cuh
+    +--------------+--------------+
+                   |
+                   v
+    +-----------------------------+
+    | recv_x / metadata / handle  |
+    +--------------+--------------+
+                   |
+                   v
+    +-----------------------------+
+    | ElasticBuffer.combine       |
+    | - 消费 EPHandle             |
+    | - 将 expert output 规约回原位 |
+    +-----------------------------+
+
+dispatch/combine 数据流:
+
+    x + topk_idx/topk_weights
+            |
+            v
+    dispatch: token -> owning expert rank
+            |
+            +--> recv_x:      本 rank local experts 的输入
+            +--> EPHandle:    combine 反向寻路需要的路线图
+            |
+            v
+    local expert compute
+            |
+            v
+    combine: expert output -> original token order
+
+阅读提示:
+    - Python 层负责“语义”和资源默认值，真实 buffer 布局在 csrc/elastic/buffer.hpp。
+    - EPHandle 是 dispatch 和 combine 的契约；如果看不懂 combine，先回来看它的字段。
+"""
+
 import os
 import math
 import torch
@@ -66,24 +122,36 @@ class EPHandle:
                  dst_buffer_slot_idx: torch.Tensor,
                  token_metadata_at_forward: Optional[torch.Tensor],
                  channel_linked_list: Optional[torch.Tensor]):
-        # NOTES: remember to copy the original users' input to prevent uncasual modifications on them
+        # 这个对象是 combine 的“路线图”，所以必须避免用户后续原地修改 topk_idx 破坏路线。
+        # do_handle_copy=True 时 C++ 会返回 cloned_topk_idx；cached dispatch 则复用旧 handle。
         assert topk_idx is not None
 
+        # 静态语义: 本轮通信的拓扑、expert 划分、layout 选择。
         self.do_expand = do_expand
         self.num_experts = num_experts
         self.expert_alignment = expert_alignment
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_sms = num_sms
+
+        # 路由输入: combine 需要知道原始 top-k 才能决定每个输出 token 从哪些 buffer slot 取数。
         self.topk_idx = topk_idx
+
+        # dispatch 产出的计数和 prefix-sum。psum_num_recv_tokens_per_scaleup_rank 的最后一个
+        # 元素就是本 rank 实际收到的 token 数；per_expert 版本用于 expand layout 和 expert 对齐。
         self.psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank
         self.psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert
         self.num_recv_tokens_per_expert_list = num_recv_tokens_per_expert_list
+
+        # combine 的关键反向索引:
+        #   recv_src_metadata:       recv token -> 原始 token / 原始 rank / top-k lane
+        #   dst_buffer_slot_idx:     原 dispatch 写入通信 buffer 的 slot
+        #   token/channel metadata:  hybrid scale-out 路径的转发与链表信息
         self.recv_src_metadata = recv_src_metadata
         self.dst_buffer_slot_idx = dst_buffer_slot_idx
         self.token_metadata_at_forward = token_metadata_at_forward
         self.channel_linked_list = channel_linked_list
 
-        # Inferred value, may not accurate without CPU sync
+        # 无 CPU sync 时这里是按分配张量的 shape 推断出来的上界，未必等于真实 token 数。
         self.num_recv_tokens = recv_src_metadata.shape[0]
 
 
@@ -159,7 +227,14 @@ class ElasticBuffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
         """
-        # Some useful utilities
+        # 1) 记录 Python 层的通信域和策略开关。
+        #
+        # rank 拆分:
+        #
+        #     global rank = scaleout_rank_idx * num_scaleup_ranks + scaleup_rank_idx
+        #
+        # scale-up 主要描述节点内/NVLink 域，scale-out 描述跨节点/RDMA 域。是否真的走
+        # NVLink 由 C++ NCCL symmetric memory context 检测决定。
         self.group = group
         self.rank_idx = group.rank()
         self.num_ranks = group.size()
@@ -168,7 +243,14 @@ class ElasticBuffer:
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
         self.nccl_comm_handle = get_nccl_comm_handle(group)
 
-        # Calculate buffer size
+        # 2) buffer 大小可由用户显式给出，也可按 MoE 形状让 C++ runtime 估算。
+        #
+        # 这个 size 必须覆盖 dispatch 和 combine 两类最大布局:
+        #
+        #     symmetric window
+        #       +-- WorkspaceLayout 固定控制区
+        #       +-- elastic communication buffer
+        #              +-- dispatch layout 或 combine layout 中较大者
         if num_bytes is None:
             # NOTES: we allow `num_topk == 0`, as the buffer size can also be calculated by number of ranks (maybe bigger though)
             num_bytes = _C.calculate_elastic_buffer_size(
@@ -189,7 +271,12 @@ class ElasticBuffer:
         if 'EP_OVERRIDE_RDMA_SL' in os.environ:
             sl_idx = int(os.environ['EP_OVERRIDE_RDMA_SL'])
 
-        # Automatic maximum QP count allowed
+        # 3) 自动分配 QP 上限。真正每次 kernel 用多少 QP 在 dispatch/combine 前再按 SM 数估算。
+        #
+        # direct mode:
+        #     少量 QP，降低 doorbell/ring 开销
+        # hybrid mode:
+        #     通常每个 channel/notify 角色都希望有可用 QP，便于 RDMA 与 NVLink 转发并行
         # TODO(tianr22): revise the QP count in consideration of Engram
         if num_allocated_qps == 0:
             # Hybrid mode will consume more QPs
@@ -200,7 +287,7 @@ class ElasticBuffer:
                 num_allocated_qps = 17
         self.num_allocated_qps = num_allocated_qps
 
-        # Create CPP handle
+        # 4) 创建 C++ runtime。这里之后的真实内存注册、workspace 划分、JIT launch 都在 C++ 层。
         self.explicitly_destroy = explicitly_destroy
         self.runtime = _C.ElasticBuffer(group.rank(), group.size(),
                                         self.nccl_comm_handle.get(),
@@ -213,7 +300,7 @@ class ElasticBuffer:
                                         num_cpu_timeout_secs, num_gpu_timeout_secs,
                                         self.explicitly_destroy)
 
-        # Logical rank indices
+        # 5) 查询 C++ 根据 NCCL communicator 解析出的逻辑/物理通信域。
         self.num_scaleout_ranks, self.num_scaleup_ranks = self.get_logical_domain_size()
         self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
         self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
@@ -221,7 +308,7 @@ class ElasticBuffer:
         # Physical rank indices
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
 
-        # Call a barrier to ensure initialization visibility for all peers
+        # 6) 初始化窗口和 workspace 后做全局同步，保证 peer 都能看到 symmetric memory。
         torch.cuda.synchronize()
         group.barrier()
         torch.cuda.synchronize()
@@ -337,6 +424,8 @@ class ElasticBuffer:
                  Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         if handle is None:
             return None, None, None, None, None, None, None
+        # cached dispatch 只把可复用的“布局结果”传回 C++；topk_idx/num_experts 等语义字段
+        # 在 Python 层已经补齐并校验。
         return (handle.num_recv_tokens,
                 handle.num_recv_tokens_per_expert_list,
                 handle.psum_num_recv_tokens_per_scaleup_rank,
@@ -557,8 +646,24 @@ class ElasticBuffer:
         """
         # TODO: support `do_expand` and `allow_multiple_reduction`
 
-        # The `1` in this function means scale-up traffic
-        # i.e. the HBM read volume of the dispatch copy epilogue, equals to "the number of tokens" * "num_expected_topk" * "data size per token"
+        # 这个模型估算的是“每个 token 的单位流量”在 RDMA/NVLink/HBM 之间如何分摊。
+        #
+        # 简化图:
+        #
+        #     balanced top-k
+        #          |
+        #          v
+        #     expected ranks touched
+        #          |
+        #          +--> RDMA traffic / rdma_gbs
+        #          +--> NVLink traffic / nvlink_gbs
+        #          +--> SM read/write traffic / per-SM HBM BW
+        #          |
+        #          v
+        #     choose smallest even SM count that covers bottleneck
+        #
+        # 这里的 `1` 表示 scale-up 方向的单位 token 流量，例如 dispatch copy epilogue
+        # 的 HBM read 量约等于 token 数 * expected top-k * 每 token 字节数。
         # NOTES: this is for balanced gate
         # For V3.0's group-limited gate, please do not use this function
         # TODO: support this
@@ -727,17 +832,26 @@ class ElasticBuffer:
         """
         check_torch_deterministic()
 
-        # Automatic decide SM and QP count
+        # A. 自动选择本次 EP kernel 的 SM/QP。
+        # 用户传 0 表示使用带宽模型；cached handle 会复用旧 topk_idx 推出 num_topk。
         num_topk = (handle.topk_idx if topk_idx is None else topk_idx).shape[1]
         num_sms = self.get_theoretical_num_sms(num_experts, num_topk) if num_sms == 0 else num_sms
         num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
         assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
 
-        # Unpack SF
+        # B. FP8 dispatch 时 x 是 (payload, scale_factor)，BF16 时 sf 为 None。
         x, sf = x if isinstance(x, tuple) else (x, None)
 
-        # Unpack handles
-        # Reuse some values if possible
+        # C. cached handle 路径:
+        #
+        #     old EPHandle
+        #          |
+        #          +--> topk_idx / prefix sums / slot idx / hybrid metadata
+        #          |
+        #          v
+        #     C++ runtime skips layout recomputation
+        #
+        # cached 模式不能再 CPU sync，因为真实计数直接沿用旧 handle。
         if handle is not None:
             assert topk_idx is None and topk_weights is None
             assert do_cpu_sync is None or not do_cpu_sync, 'Cannot do CPU sync with cached handle'
@@ -756,12 +870,16 @@ class ElasticBuffer:
          cached_token_metadata_at_forward,
          cached_channel_linked_list) = self._unpack_handle(handle)
 
-        # Some default values
+        # D. 默认值收敛。num_max_tokens_per_rank 可来自构造函数，也可每次调用覆盖。
         num_max_tokens_per_rank = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
         expert_alignment = value_or(expert_alignment, 1)
         do_cpu_sync = value_or(do_cpu_sync, True)
 
-        # Do dispatch
+        # E. 进入 C++ runtime。返回值可分成三类:
+        #
+        #     user-visible outputs: recv_x / recv_sf / recv_topk_*
+        #     handle metadata:      copied_topk_idx / prefix sums / slot idx / hybrid metadata
+        #     stream event:         async overlap 时交给 EventOverlap
         (recv_x, recv_sf,
          recv_topk_idx, recv_topk_weights,
          cloned_topk_idx,
@@ -790,6 +908,7 @@ class ElasticBuffer:
                                         do_handle_copy, do_cpu_sync, do_expand,
                                         use_tma_aligned_col_major_sf)
         if handle is None:
+            # 首次 dispatch 生成新的 handle；cached dispatch 直接复用传入的 handle。
             handle = EPHandle(do_expand,
                               num_experts, expert_alignment,
                               num_max_tokens_per_rank,
@@ -803,10 +922,9 @@ class ElasticBuffer:
                               token_metadata_at_forward,
                               channel_linked_list)
 
-        # Repack SF
+        # F. 保持 Python API 输入输出对称: FP8 输入 tuple -> FP8 输出 tuple。
         recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
 
-        # Return
         return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
 
     @staticmethod
@@ -858,12 +976,23 @@ class ElasticBuffer:
         """
         check_torch_deterministic()
 
-        # Automatic decide SM and QP count
+        # combine 是 dispatch 的反向路径，默认复用 handle.num_sms，保证 hybrid channel 划分一致。
         num_sms = handle.num_sms if num_sms == 0 else num_sms
         num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
         assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
 
         bias_0, bias_1 = ElasticBuffer._unpack_bias(bias)
+        # C++ combine 消费的核心是 handle 中的 recv_src_metadata 和 hybrid metadata:
+        #
+        #     expert output x
+        #          |
+        #          v
+        #     handle.recv_src_metadata  -> 找到原 token/rank/top-k lane
+        #     handle.topk_idx           -> 决定最终输出哪些 top-k 需要规约
+        #     channel metadata          -> hybrid 路径重放 dispatch 的转发顺序
+        #          |
+        #          v
+        #     combined_x
         combined_x, combined_topk_weights, event = \
             self.runtime.combine(x, topk_weights,
                                  bias_0, bias_1,

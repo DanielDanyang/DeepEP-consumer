@@ -9,6 +9,31 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * deterministic dispatch prologue。
+ *
+ * 目的:
+ *   在主 dispatch kernel 之前，为每个 token/top-k 计算稳定的 dst_buffer_slot_idx。
+ *   这样 main dispatch 不再依赖 atomicAdd 的非确定性顺序。
+ *
+ * 两遍扫描:
+ *
+ *     pass 1: 每个 warp 统计自己负责 token 会发给各 rank 的去重数量
+ *             -> rank_count_buffer[sm][rank]
+ *
+ *     grid sync
+ *
+ *     pass 2: 计算当前 SM/warp 之前的 prefix sum
+ *             -> dst_buffer_slot_idx[token][topk]
+ *
+ * lane 分组:
+ *
+ *     one warp lanes
+ *       token0 topk lanes | token1 topk lanes | ... | tokenN topk lanes
+ *
+ * 同一个 token 多个 expert 落同一 rank 时只计一次，避免向同 rank 重复发送。
+ */
+
 // TODO: support scale-out
 template <int kNumSMs, int kNumWarps,
           int kNumScaleupRanks,
@@ -31,20 +56,24 @@ dispatch_deterministic_prologue_impl(
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
     const auto global_warp_idx = sm_idx * kNumWarps + warp_idx;
 
-    // Token region the current warp is responsible for
+    // 当前 warp 负责一段连续 token。
     const auto num_tokens_per_warp = math::ceil_div(num_tokens, kNumSMs * kNumWarps);
     const auto start_token_idx = global_warp_idx * num_tokens_per_warp;
     const auto end_token_idx = min(start_token_idx + num_tokens_per_warp, num_tokens);
 
-    // Group configs
-    // NOTES: Group refers to the tokens that each warp handles concurrently
+    // 一个 warp 同时处理 kNumTokensPerGroup 个 token；每个 token 占 kNumTopk 条 lane。
     constexpr int kNumTokensPerGroup = 32 / kNumTopk;
     const auto token_idx_offset = lane_idx / kNumTopk;
     const unsigned token_mask = ((1u << kNumTopk) - 1) << (token_idx_offset * kNumTopk);
     EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k");
 
-    // Shared memory for reduction
-    // NOTES: Each warp owns separate shared memory region for separate sum.
+    // shared memory:
+    //
+    //     rank_count_global_psum[num_ranks]
+    //     rank_count_warp_sum[num_warps][num_ranks]
+    //     rank_count_warp_psum[num_warps][num_ranks]
+    //
+    // 每个 warp 先独立计数，之后 block 内规约。
     extern __shared__ int8_t smem[];
     const auto rank_count_global_psum = math::advance_ptr<int>(smem, 0);
     const auto rank_count_warp_sum = math::advance_ptr<int>(rank_count_global_psum, (kNumScaleupRanks + warp_idx * kNumScaleupRanks) * sizeof(int));
@@ -70,7 +99,7 @@ dispatch_deterministic_prologue_impl(
         return math::advance_ptr<int>(rank_count_warp_sum, (other_warp_idx - warp_idx) * kNumScaleupRanks * sizeof(int));
     };
 
-    // Each warp scan the tokens separately
+    // pass 1: 统计本 warp 对每个 rank 的去重发送数量。
     for (int i = start_token_idx; i < end_token_idx; i += kNumTokensPerGroup) {
         const auto token_idx = i + token_idx_offset;
         const auto is_active_thread = lane_idx < kNumTopk * kNumTokensPerGroup and token_idx < end_token_idx;
@@ -87,7 +116,7 @@ dispatch_deterministic_prologue_impl(
     }
     __syncthreads();
 
-    // Get block sum and store to global
+    // block sum 写到全局 rank_count_buffer，供所有 SM 做 prefix。
     for (int rank_idx = thread_idx; rank_idx < kNumScaleupRanks; rank_idx += kNumThreads) {
         int rank_count_block_sum = 0;
         for (int i = 0; i < kNumWarps; i++)
@@ -96,7 +125,7 @@ dispatch_deterministic_prologue_impl(
     }
     cooperative_groups::this_grid().sync();
 
-    // Get the prefix sum before the current SM
+    // 计算当前 SM 之前所有 SM 的 rank count 前缀。
     for (int rank_idx = lane_idx; rank_idx < kNumScaleupRanks; rank_idx += 32) {
         int rank_count = 0;
         for (int i = warp_idx; i < sm_idx; i += kNumWarps)
@@ -105,7 +134,7 @@ dispatch_deterministic_prologue_impl(
     }
     __syncthreads();
 
-    // Get each warp's prefix sum
+    // 再加上当前 SM 内更早 warp 的 count，得到本 warp 的 slot 起点。
     for (int rank_idx = lane_idx; rank_idx < kNumScaleupRanks; rank_idx += 32) {
         int rank_count = rank_count_global_psum[rank_idx];
         for (int i = 0; i < warp_idx; i++)
@@ -114,7 +143,7 @@ dispatch_deterministic_prologue_impl(
     }
     __syncwarp();
 
-    // Each warp scan the tokens separately
+    // pass 2: 用前缀和为每个 token/top-k lane 写稳定 slot。
     for (int i = start_token_idx; i < end_token_idx; i += kNumTokensPerGroup) {
         const auto token_idx = i + token_idx_offset;
         const auto is_active_thread = lane_idx < kNumTopk * kNumTokensPerGroup and token_idx < end_token_idx;

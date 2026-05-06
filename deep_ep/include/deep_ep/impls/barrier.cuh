@@ -8,6 +8,20 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * GPU barrier kernel 主体。
+ *
+ * launch wrapper 已经把 topology 固定成模板参数。kernel 内只做一件事:
+ *
+ *     construct WorkspaceLayout + NCCLGin
+ *              |
+ *              v
+ *     comm::gpu_barrier(...)
+ *
+ * WorkspaceLayout num_experts 传 0 是安全的，因为 barrier 只使用 workspace 开头的
+ * NVLink/Gin signal 区域，不访问 expert count 区。
+ */
+
 template <bool kIsScaleupNVLink,
           int kNumSMs, int kNumThreads,
           int kNumScaleoutRanks, int kNumScaleupRanks,

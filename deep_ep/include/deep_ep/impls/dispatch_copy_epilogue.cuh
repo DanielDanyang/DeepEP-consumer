@@ -8,6 +8,39 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Dispatch copy epilogue。
+ *
+ * 输入:
+ *   communication buffer 中按 source rank/channel 排列的 token slots。
+ *
+ * 输出:
+ *   recv_x / recv_sf / recv_topk_idx / recv_topk_weights / recv_src_metadata。
+ *
+ * 流程:
+ *
+ *     main dispatch kernel writes peer recv buffer
+ *              |
+ *              v
+ *     cudaGridDependencySynchronize()
+ *              |
+ *              v
+ *     for each received token slot:
+ *         TMA load token slot -> shared memory
+ *         validate local expert / choose expanded dst index
+ *         TMA store hidden -> recv_x
+ *         copy sf/topk/weights/metadata
+ *         build hybrid linked list if needed
+ *
+ * expand vs non-expand:
+ *
+ *     non-expand:
+ *       one recv token row per source token, recv_topk_idx keeps local expert lanes
+ *
+ *     expand:
+ *       one row per (token, local expert) selection, per-expert atomic counter decides row
+ */
+
 template <bool kDoExpand, bool kCachedMode,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
@@ -54,7 +87,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
     __syncwarp();
 
-    // Will block until the main dispatch kernel has finished and all data are visible
+    // 等待 main dispatch 的 Programmatic Dependent Launch 完成。
     // NOTES: PDL is used, please do not use `__ldg`
     cudaGridDependencySynchronize();
 
@@ -62,12 +95,12 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
         num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1];
 
-    // Current rank indices should be maintained
+    // 按 psum_num_recv_tokens_per_scaleup_rank 把全局 recv token index 映射回 source rank。
     int current_rank_idx = -1, stored_psum_num_recv_tokens;
     int current_rank_start = 0, current_rank_end = 0;
     #pragma unroll
     for (int i = global_warp_idx; i < num_recv_tokens; i += kNumWarps * kNumSMs) {
-        // Calculate token index in the buffer
+        // 找到 token i 位于哪个 source rank buffer 的哪个 slot。
         while (i >= current_rank_end) {
             current_rank_idx += 1;
             EP_DEVICE_ASSERT(current_rank_idx < kNumScaleupRanks);
@@ -83,8 +116,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         ptx::tma_store_wait();
         __syncwarp();
 
-        // Issue TMA loads
-        // Including all stuffs: data, SF, top-k metadata
+        // TMA 读入完整 token slot: hidden + sf + top-k metadata + source metadata。
         if (ptx::elect_one_sync()) {
             ptx::tma_load_1d(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
                              mbarrier_ptr, tma_buffer.get_num_bytes<false>());
@@ -99,7 +131,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             dst_expert_idx = buffer_token.get_topk_idx_ptr()[lane_idx];
         __syncwarp();
 
-        // Validate target expert indices and store for non-expand mode
+        // 把全局 expert id 转成本 rank local expert id；非本地 expert lane 标成 -1。
         const auto in_range = expert_start_idx <= dst_expert_idx and dst_expert_idx < expert_end_idx;
         const auto master_src_topk_idx = ptx::get_master_lane_idx(ptx::gather(in_range));
         dst_expert_idx = in_range ? dst_expert_idx - expert_start_idx : -1;
@@ -108,7 +140,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             recv_topk_idx[i * kNumTopk + lane_idx] = static_cast<topk_idx_t>(dst_expert_idx);
         __syncwarp();
 
-        // Calculate target indices in the tensor
+        // non-expand: recv row 与 token i 一一对应。
+        // expand: 每个 local expert lane 通过 per-expert atomic counter 申请 row。
         int dst_tensor_idx = -1;
         if (not kDoExpand and ptx::elect_one_sync()) {
             dst_tensor_idx = i;
@@ -122,7 +155,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
         __syncwarp();
 
-        // Maintain linked list
+        // hybrid dispatch 需要 linked list 让 hybrid_combine 按 channel/scaleup rank 重放路径。
         if constexpr (kDoCreateLinkedList) {
             if (ptx::elect_one_sync())
                 channel_linked_list[tma_buffer.get_linked_list_idx_ptr()[master_src_topk_idx]] = i;
@@ -180,7 +213,11 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
         __syncwarp();
 
-        // Write source token index
+        // recv_src_metadata 是 combine 的反向地图。
+        //
+        //     [0] src global token idx
+        //     [1] direct: current_rank_idx * topk + master topk lane
+        //         hybrid: slot_in_rank * topk + master topk lane
         // And:
         //   - Non-hybrid mode: the source scaleup peer rank index and master top-k lane index
         //   - Hybrid mode: the slot index and master top-k lane index
@@ -195,14 +232,13 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
         __syncwarp();
 
-        // Write reduction source indices
+        // expand mode 额外记录每个 top-k lane 对应的 expanded recv_x row。
         if (kDoExpand and lane_idx < kNumTopk)
             recv_src_metadata[i * kMetadataStride + 2 + lane_idx] = dst_tensor_idx;
         __syncwarp();
     }
 
-    // Maintain linked list's ending
-    // Or you can understand it as writing the tail at once
+    // 写 linked list 结束标记 -1，并清理 workspace tail，供下一轮 dispatch 复用。
     if constexpr (kDoCreateLinkedList) {
         constexpr int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32);
         const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);

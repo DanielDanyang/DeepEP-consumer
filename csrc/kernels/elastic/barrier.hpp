@@ -11,6 +11,26 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Barrier JIT wrapper。
+ *
+ * v2 所有跨 rank buffer 复用都依赖 GPU-side barrier 保证可见性:
+ *
+ *     rank local work
+ *          |
+ *          v
+ *     launch_barrier
+ *          |
+ *          +-- scale-up NVLink: workspace signal + system atomics
+ *          +-- scale-up non-NVLink / scale-out: NCCL Gin signal
+ *          |
+ *          v
+ *     all peers see previous stores
+ *
+ * hybrid mode 同时有 scale-out 与 scale-up 两个子域，所以 barrier kernel 用 2 个 SM；
+ * direct/single-domain barrier 只用 1 个 SM。
+ */
+
 class BarrierRuntime final : public jit::LaunchRuntime<BarrierRuntime> {
 public:
     struct Args {
@@ -59,11 +79,10 @@ static void launch_barrier(const ncclDevComm_t& nccl_dev_comm, const ncclWindow_
                            const int64_t& num_timeout_cycles,
                            const bool& is_scaleup_nvlink,
                            const at::cuda::CUDAStream& stream) {
-    // Number of threads equals to the number of ranks
+    // 线程数固定 512，覆盖当前 WorkspaceLayout 支持的常见 rank fanout。
     constexpr auto kNumThreads = 512;
 
-    // Generate, build and launch
-    // NOTES: only the hybrid kernel needs 2 SMs
+    // 只有 hybrid barrier 需要 2 个 SM，分别推进 scale-up 和 scale-out 子域。
     const auto num_sms = num_scaleout_ranks > 1 ? 2 : 1;
     const BarrierRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,

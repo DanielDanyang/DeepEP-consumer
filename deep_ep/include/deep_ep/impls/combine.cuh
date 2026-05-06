@@ -12,6 +12,37 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Direct combine main kernel。
+ *
+ * combine 是 dispatch 的反向:
+ *
+ *     recv_src_metadata tells:
+ *       - 原 token global idx
+ *       - 原 source rank
+ *       - dispatch 时的 master top-k lane / slot
+ *
+ * main kernel 做:
+ *
+ *     expert output x
+ *          |
+ *          v
+ *     optional local reduce for expanded layout
+ *          |
+ *          v
+ *     write remote/local reduce buffer
+ *          |
+ *          v
+ *     combine_reduce_epilogue later reduces to combined_x
+ *
+ * 路径:
+ *   - NVLink accessible: 直接 TMA store 到 peer reduce buffer
+ *   - RDMA: 先写本地 send buffer，再 Gin put 到 peer reduce buffer
+ *
+ * allow_multiple_reduction=false 时会尽量不在通信途中多次规约，保留更多 top-k slot 给
+ * epilogue 做最终规约。
+ */
+
 template <bool kIsScaleupNVLink,
           bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs, int kNumWarps,
@@ -79,19 +110,19 @@ combine_impl(nv_bfloat16* x,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
-    // Do TMA writes into the remote buffers
+    // 每个 warp/channel 处理一段 recv token，把 expert output 推回 source rank 的 reduce buffer。
     int num_tokens_per_warp = math::ceil_div(num_reduced_tokens, kNumSMs * kNumWarps);
     const int token_start_idx = num_tokens_per_warp * global_warp_idx;
     const int token_end_idx = min(token_start_idx + num_tokens_per_warp, num_reduced_tokens);
     for (int i = token_start_idx; i < token_end_idx; ++ i) {
-        // The master slot index during dispatch
+        // dispatch epilogue 写出的反向索引。
         constexpr int kMetadataStride = 2 + kNumTopk;
         const int src_token_idx = __ldg(src_metadata + i * kMetadataStride) % kNumMaxTokensPerRank;
         const int src_rank_topk_idx = __ldg(src_metadata + i * kMetadataStride + 1);
         const int src_rank_idx = src_rank_topk_idx / kNumTopk;
         const int src_topk_idx = src_rank_topk_idx % kNumTopk;
 
-        // Directly to the remote or via RDMA
+        // 目标 token buffer 可能在 peer recv_buffer，也可能需要先写本地 send_buffer。
         const bool nvlink_bypass = gin.is_nvlink_accessible<team_t>(src_rank_idx);
         layout::TokenLayout master_token_buffer = [=]() {
             // NVLink bypass
@@ -118,10 +149,10 @@ combine_impl(nv_bfloat16* x,
             __syncwarp();
         }
 
-        // 3 cases:
-        //  - no expand + no reduce, or expand + no reduce
-        //  - expand + reduce
-        //  - expand + send all
+        // 三种发送/规约策略:
+        //   1. non-expand 或 expanded 只有一个有效 slot: 直接搬运
+        //   2. expanded 且允许多次规约: 先在本 warp 本地规约再发送
+        //   3. expanded 且不允许多次规约: top-k slot 全部发送，epilogue 统一规约
         auto reduce_valid_mask = ptx::gather(stored_topk_slot_idx >= 0);
         auto no_local_reduce = not kUseExpandedLayout or (kAllowMultipleReduction and __popc(reduce_valid_mask) == 1);
         if (no_local_reduce) {
@@ -230,7 +261,7 @@ combine_impl(nv_bfloat16* x,
         }
     }
 
-    // Final barrier to ensure data arrival
+    // 确保所有 reduce buffer 写入完成，epilogue 才能安全读取。
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag1, true, true, false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);

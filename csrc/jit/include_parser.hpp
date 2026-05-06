@@ -10,6 +10,22 @@
 
 namespace deep_ep::jit {
 
+/*
+ * JIT include hash 解析器。
+ *
+ * 问题:
+ *   generated source 本身很短，但真正 kernel 逻辑在 <deep_ep/...> include 里。
+ *   如果只 hash generated source，修改 impl/header 后可能错误复用旧 cubin。
+ *
+ * 方案:
+ *   递归解析标准格式 include:
+ *
+ *       #include <deep_ep/...>
+ *
+ *   对每个 include 文件内容和其子 include 计算 hash，拼到 source 前作为注释，
+ *   最终参与 Compiler::build 的 cache key。
+ */
+
 class IncludeParser {
     std::unordered_map<std::string, std::optional<std::string>> cache;
 
@@ -19,7 +35,7 @@ class IncludeParser {
         std::sregex_iterator iter(code.begin(), code.end(), pattern);
         const std::sregex_iterator end;
 
-        // TODO: parse relative paths as well
+        // 只接受规范的 #include <deep_ep/...>，避免 JIT cache 漏掉相对路径依赖。
         for (; iter != end; ++ iter) {
             const auto include_str = iter->str();
             const int len = include_str.length();
@@ -54,7 +70,7 @@ public:
     }
 
     std::string get_hash_value_by_path(const std::filesystem::path& path) {
-        // Check whether hit in cache
+        // cache[path] = nullopt 表示当前递归栈正在解析该文件，用来检测 circular include。
         // ReSharper disable once CppUseAssociativeContains
         if (cache.count(path) > 0) {
             const auto opt = cache[path];

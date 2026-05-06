@@ -14,6 +14,45 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Direct dispatch main kernel。
+ *
+ * 适用场景:
+ *   num_scaleout_ranks == 1，即没有 hybrid scale-out forwarding。
+ *
+ * warp roles:
+ *
+ *     +-----------------------------+
+ *     | notify warps                |
+ *     | - count tokens per rank     |
+ *     | - count tokens per expert   |
+ *     | - publish counts to peers   |
+ *     | - produce prefix sums       |
+ *     +-----------------------------+
+ *     | dispatch warps              |
+ *     | - load x/sf/topk metadata   |
+ *     | - assign dst slot           |
+ *     | - TMA store to peer buffer  |
+ *     | - optional RDMA put         |
+ *     +-----------------------------+
+ *
+ * data path:
+ *
+ *     x/topk on source rank
+ *          |
+ *          v
+ *     shared-memory TMA token slot
+ *          |
+ *          +-- NVLink accessible peer -> direct TMA store to peer recv buffer
+ *          |
+ *          +-- not NVLink accessible  -> local send buffer -> Gin put -> peer recv buffer
+ *          |
+ *          v
+ *     dispatch_copy_epilogue later converts recv buffer -> recv_x/metadata
+ *
+ * main kernel 结束时触发 Programmatic Dependent Launch，允许 copy epilogue 在数据到达后继续。
+ */
+
 template <bool kIsScaleupNVLink,
           bool kDoCPUSync,
           bool kReuseSlotIndices,
@@ -74,7 +113,7 @@ dispatch_impl(
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
-    // Different warp roles
+    // 角色 1: notify/count warps。cached mode 下 kNumNotifyWarps 为 0，此分支不会存在。
     if (warp_idx < kNumNotifyWarps) {
         // Assign shared memory
         constexpr int kNumAlignedElems = kNumSmemBytesForNotify / sizeof(int);
@@ -88,7 +127,9 @@ dispatch_impl(
             rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
         ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
-        // Atomic add on shared memory
+        // 本地统计:
+        //   expert_count 逐 expert 计数
+        //   rank_count 对同一 token 的重复 rank 做去重后计数
         EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes");
         const auto global_warp_idx = warp_idx * kNumSMs + sm_idx;
         for (int i = global_warp_idx; i < num_tokens; i += kNumNotifyWarps * kNumSMs) {
@@ -106,7 +147,7 @@ dispatch_impl(
         }
         ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
-        // Do full-grid reduction
+        // 所有 SM 把本地 count 加到 workspace 的 reduction 区。
         #pragma unroll
         for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
             const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
@@ -147,7 +188,7 @@ dispatch_impl(
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
             // TODO: for further optimization, we can fuse rank and expert counters
-            // Issue scaleup rank count writes to peers
+            // 把本 rank 发给每个 peer 的 rank count 发布到 peer workspace。
             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
                 // Rank counters
                 const auto dst_rank_counter =
@@ -157,7 +198,7 @@ dispatch_impl(
             }
             __syncwarp();
 
-            // Issue scaleup expert count writes to peers
+            // 发布 expert count。NVLink 可逐元素 put_value；RDMA 路径先写 send 区再 bulk put。
             if constexpr (kIsScaleupNVLink) {
                 // NVLink per-element copy
                 // We don't use TMA as the dtype of shared memory and global is different
@@ -179,7 +220,7 @@ dispatch_impl(
             // This is necessary, as the waited results will rewrite the shared memory
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
-            // Wait for rank and expert count
+            // 等待所有 peer 发布给本 rank 的 rank/expert count。
             const auto start_clock = clock64();
             for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
                 comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
@@ -200,7 +241,7 @@ dispatch_impl(
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
-            // Reduce expert count and add stats
+            // 将所有来源 rank 的 expert count 规约到本地 expert，并做 expert_alignment 对齐。
             for (int i = thread_idx; i < kNumExpertsPerRank; i += kNumNotifyThreads) {
                 int sum = 0;
                 #pragma unroll
@@ -214,7 +255,7 @@ dispatch_impl(
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
-            // Write host workspace
+            // CPU sync 模式把 encoded count 写到 host-mapped workspace，host 会轮询读取。
             if constexpr (kDoCPUSync) {
                 for (int i = thread_idx; i < kNumRanks + kNumExpertsPerRank; i += kNumNotifyThreads) {
                     host_workspace_layout.get_scaleup_rank_expert_count_ptr<false>()[i] =
@@ -223,7 +264,9 @@ dispatch_impl(
                 __syncwarp();
             }
 
-            // Do prefix sum by the warps
+            // 产生两个 prefix sum:
+            //   rank inclusive psum  -> dispatch epilogue 知道每个 source rank 的 token 范围
+            //   expert exclusive psum -> expand layout 下作为 per-expert 写入起点
             // NOTES: we may have fast implementation with `cub::BlockScan`, but it is too heavy to use
             const auto do_psum = [=](const int* count, int* out, const int n, const int is_exclusive) {
                 int psum = 0;
@@ -251,6 +294,7 @@ dispatch_impl(
             }
         }
     } else {
+        // 角色 2: dispatch warps。每个 warp/channel 负责 token_stride 间隔的一组 token。
         const int dispatch_warp_idx = warp_idx - kNumNotifyWarps;
 
         // Buffer layouts
@@ -268,7 +312,11 @@ dispatch_impl(
             ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
         __syncwarp();
 
-        // Iterate all tokens
+        // 对每个本地 token:
+        //   1. TMA/cp.async 读 payload 和 scale factor 到 shared token slot
+        //   2. 读取 top-k，写 metadata
+        //   3. 为去重后的目标 rank 分配 slot
+        //   4. 直写 NVLink peer 或 RDMA put
         const auto token_start = dispatch_warp_idx * kNumSMs + sm_idx;
         const auto token_stride = kNumDispatchWarps * kNumSMs;
         for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
@@ -327,7 +375,8 @@ dispatch_impl(
             ptx::tma_store_fence();
             __syncwarp();
 
-            // Deduplicate ranks and assign slots
+            // 同一个 token 多个 expert 落到同一目标 rank 时只发送一次 payload。
+            // kReuseSlotIndices=true 时来自 deterministic prologue 或 cached handle。
             int stored_dst_slot_idx = -1;
             if constexpr (kReuseSlotIndices) {
                 if (lane_idx < kNumTopk)
@@ -353,7 +402,7 @@ dispatch_impl(
             }
             __syncwarp();
 
-            // TMA store to send buffer
+            // 非纯 NVLink 时先落本地 send buffer，随后 Gin put 到远端 recv buffer。
             auto send_buffer_ptr = send_buffer.get_token_buffer(token_idx).get_base_ptr();
             if constexpr (not kIsScaleupNVLink) {
                 if (ptx::elect_one_sync())
@@ -362,7 +411,7 @@ dispatch_impl(
                 __syncwarp();
             }
 
-            // Issue TMA NVLink stores
+            // NVLink/LSA 可达时直接把 shared token slot TMA store 到 peer recv buffer。
             EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid top-k selection");
             const auto dst_ptr = stored_dst_slot_idx >= 0 ?
                 gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
@@ -372,7 +421,7 @@ dispatch_impl(
             ptx::tma_store_commit();
             __syncwarp();
 
-            // Issue RDMA put
+            // peer 不可通过 symmetric pointer 访问时，走 RDMA put。
             if constexpr (not kIsScaleupNVLink) {
                 // Wait the send buffer store to arrive
                 ptx::tma_store_wait<1>();
@@ -388,7 +437,7 @@ dispatch_impl(
         }
     }
 
-    // Barrier to ensure data arrival
+    // 确保所有 recv buffer 写入对本 rank 可见，然后 PDL 触发 copy epilogue。
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true, true, false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);

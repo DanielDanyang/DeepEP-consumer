@@ -8,6 +8,43 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Hybrid combine main kernel。
+ *
+ * 它重放 hybrid dispatch 的反向路径:
+ *
+ *     expert output x
+ *          |
+ *          v
+ *     scaleup warps:
+ *       follow channel_linked_list
+ *       write scaleup_buffer for each destination scale-up peer
+ *       publish channel scale-up tails
+ *          |
+ *          v
+ *     forward warps:
+ *       replay token_metadata_at_forward
+ *       wait scale-up tails
+ *       reduce/merge top-k data
+ *       write local scaleout_recv_buffer or RDMA put to source scale-out rank
+ *          |
+ *          v
+ *     combine_reduce_epilogue reads final reduce buffer
+ *
+ * 与 dispatch 的对应关系:
+ *
+ *     dispatch forward metadata:
+ *       src token global idx
+ *       chunk end flag
+ *       per-topk destination scaleup rank
+ *       per-topk destination slot
+ *
+ *     combine uses it to know:
+ *       which scale-up ranks must produce this token
+ *       when all required pieces arrived
+ *       where to send reduced token back in scale-out domain
+ */
+
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
           int kNumScaleupWarps, int kNumForwardWarps,
@@ -102,7 +139,8 @@ hybrid_combine_impl(nv_bfloat16* x,
     constexpr int kNumRegistersForScaleupWarps = 40;
     constexpr int kNumRegistersForForwardWarps = 256 - kNumRegistersForScaleupWarps;
 
-    // Different warp roles
+    // 角色 1: scale-up warps。沿 dispatch_copy_epilogue 生成的 linked list 读取 expert output，
+    // 写入目标 scale-up peer 的 scaleup_buffer，并发布 per-channel tail。
     if (warp_idx < kNumScaleupWarps) {
         const auto channel_idx = sm_idx * kNumChannelsPerSM + warp_idx;
 
@@ -118,8 +156,7 @@ hybrid_combine_impl(nv_bfloat16* x,
         if constexpr (kUseExpandedLayout)
             EP_DEVICE_ASSERT(topk_weights == nullptr);
 
-        // Tail issuer
-        // `st.release.sys` is pretty slow, so do it by an interval
+        // tail 发布器。release system store 较慢，因此按 interval 批量发布。
         int update_counter = 0;
         int stored_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         int stored_old_num_tokens_sent[kNumScaleupRanksPerLane] = {};
@@ -147,8 +184,10 @@ hybrid_combine_impl(nv_bfloat16* x,
             __syncwarp();
         };
 
-        // Shape of `channel_linked_list`: `[kNumChannels, kNumMaxTokensPerChannel + 1, kNumScaleupRanks]`
-        // Iterate until all scale-up peers finish
+        // channel_linked_list 形状:
+        //   [kNumChannels, kNumScaleoutRanks * kNumMaxTokensPerChannel + 1, kNumScaleupRanks]
+        //
+        // 每个 scaleup lane 保存当前 linked-list index，直到读到 -1 结束。
         int dst_scaleup_rank_idx = channel_idx;
         int stored_ll_idx[kNumScaleupRanksPerLane] = {}, stored_token_idx[kNumScaleupRanksPerLane] = {};
         #pragma unroll
@@ -174,7 +213,7 @@ hybrid_combine_impl(nv_bfloat16* x,
             if (exited)
                 break;
 
-            // Process tokens for all ranks together using bitmask to skip inactive ranks
+            // 用 bitmask 挑选当前还有 token 的 scale-up rank，round-robin 防止某一 rank 独占。
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up ranks for 64-bit mask");
             using mask_t = std::conditional_t<(kNumScaleupRanks <= 32), uint32_t, uint64_t>;
             mask_t wip_mask = 0;
@@ -197,7 +236,8 @@ hybrid_combine_impl(nv_bfloat16* x,
                 }
                 token_idx = ptx::exchange(token_idx, dst_scaleup_rank_idx % 32);
 
-                // Get source metadata and decide the destination buffer
+                // src_metadata 来自 dispatch epilogue；它告诉 combine 当前 expert output
+                // 应该回写到原 token 的哪一个 scale-up/scale-out buffer slot。
                 constexpr int kMetadataStride = 2 + kNumTopk;
                 const auto src_global_token_idx = __ldg(src_metadata + token_idx * kMetadataStride + 0);
                 const auto src_token_idx = src_global_token_idx % kNumMaxTokensPerRank;
@@ -226,10 +266,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                     __syncwarp();
                 }
 
-                // 3 cases:
-                //  - no-expand, expand + no-reduce
-                //  - expand + reduce
-                //  - expand + send all
+                // 与 direct combine 一样，按 expanded/multiple_reduction 分三种策略。
                 auto reduce_valid_mask = ptx::gather(stored_topk_slot_idx >= 0);
                 auto no_local_reduce = not kUseExpandedLayout or (kAllowMultipleReduction and __popc(reduce_valid_mask) == 1);
                 if (no_local_reduce) {
@@ -309,7 +346,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                 }
                 __syncwarp();
 
-                // Issue TMA stores into remote scale-up buffer
+                // 把规约或直接搬运后的 token 写入目标 scale-up peer buffer。
                 // NOTES: `kDoExpandedSend` mode has already issued
                 if (not kDoExpandedSend and ptx::elect_one_sync()) {
                     // Wait TMA arrival (only for non-reduced cases)
@@ -340,9 +377,11 @@ hybrid_combine_impl(nv_bfloat16* x,
                 stored_ll_idx[i] += (stored_token_idx[i] >= 0);
         }
 
-        // Update for the unissued ones
+        // flush 最后一批 tail，通知 forward warps 所有 linked-list token 已处理。
         update_tails(true);
     } else {
+        // 角色 2: forward warps。按 dispatch 记录的 token_metadata_at_forward 顺序重放，
+        // 等待所需 scale-up ranks 的 tail，规约后返回 source scale-out rank。
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
 
@@ -357,7 +396,7 @@ hybrid_combine_impl(nv_bfloat16* x,
         constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
         token_metadata_at_forward += channel_idx * ((kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumForwardMetadataDims);
 
-        // Overlap TMA stores and reduction
+        // 上一个 token 的 TMA store/RDMA put 与当前 token 的 reduce 重叠。
         int last_src_scaleout_rank_idx = -1;
         int last_is_token_last_in_chunk = 0;
         void* last_recv_token_buffer_ptr = nullptr;
@@ -380,7 +419,7 @@ hybrid_combine_impl(nv_bfloat16* x,
             __syncwarp();
         };
 
-        // Replay the dispatch
+        // 重放 dispatch forward metadata，直到 src_token_global_idx == -1。
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
         for (int i = 0; ; ++ i) {
             const auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
@@ -395,7 +434,7 @@ hybrid_combine_impl(nv_bfloat16* x,
             if (src_token_global_idx < 0)
                 break;
 
-            // Scaleup rank mask
+            // 本 token 需要等待哪些 scale-up rank 产出。
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up peers");
             using mask_t = std::conditional_t<kNumScaleupRanks <= 32, unsigned, unsigned long long>;
             const auto scaleup_mask = ptx::reduce_or(
@@ -406,7 +445,7 @@ hybrid_combine_impl(nv_bfloat16* x,
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                 stored_is_scaleup_rank_needed[j] = (scaleup_mask >> (j * 32 + lane_idx)) & 1;
 
-            // Wait all tails to arrive
+            // 等所有需要的 scale-up rank tail 前进到当前 token。
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                 bool arrived = true;
                 #pragma unroll
@@ -445,7 +484,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                 stored_num_tokens_recv[j] += static_cast<int>(stored_is_scaleup_rank_needed[j]);
             
             if constexpr (not kAllowMultipleReduction) {
-                // Cases where multiple reduction is disabled. We need to forward all data from scaleup peers to scaleout peers
+                // 禁止多次规约时，保留 top-k slot，把所有需要的数据转发到 scale-out reduce buffer。
                 // TODO: Let scale-up warps directly put data into `send_buffer`?
                 const auto src_slot_idx = src_scaleout_rank_idx * kNumMaxTokensPerRank + src_token_idx;
                 auto topk_valid_mask = kUseExpandedLayout ?
@@ -487,6 +526,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                 }
                 __syncwarp();
             } else {
+                // 允许多次规约时，在 forward warp 本地先规约来自 scale-up peers 的 token。
                 // NOTES: we must do deduplicate and only add once from one rank
                 auto reduce_valid_mask = ptx::gather(
                     ptx::deduplicate(stored_src_scaleup_rank_idx, lane_idx) and stored_src_scaleup_rank_idx >= 0);
@@ -535,7 +575,7 @@ hybrid_combine_impl(nv_bfloat16* x,
                 ptx::tma_store_fence();
                 __syncwarp(); // Necessary to let the leader lane see the writes
 
-                // Assign send and receive buffers
+                // 本 scale-out rank 直接写 recv buffer；远端 scale-out rank 先写 send buffer 再 RDMA put。
                 // NOTES: as we only have 1 destination, we will use "send" as "recv" for local transfer
                 int scaleout_recv_buffer_rank_idx;
                 if constexpr (kUseScaleoutRankLayout) {
@@ -569,7 +609,7 @@ hybrid_combine_impl(nv_bfloat16* x,
         if constexpr (kAllowMultipleReduction)
             flush_last_tma_and_issue_rdma();
 
-        // Clean scaleup tails
+        // 清理 channel scale-up tails，供下一轮 dispatch/combine 复用。
         #pragma unroll
         for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
             const auto k = j * 32 + lane_idx;
@@ -578,7 +618,7 @@ hybrid_combine_impl(nv_bfloat16* x,
         }
         __syncwarp();
 
-        // Update, wait and clean
+        // scale-out 范围内通知所有 peers: 当前 channel combine 已完成，并等待所有 peer 完成。
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
         if (lane_idx < kNumScaleoutRanks) {
             // Update remote tails

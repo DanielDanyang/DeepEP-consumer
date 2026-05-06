@@ -10,6 +10,32 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Combine JIT wrapper。
+ *
+ * combine 是 dispatch 的反向通信:
+ *
+ *     expert output x
+ *          |
+ *          v
+ *     launch_combine main kernel
+ *          |
+ *          +-- direct: combine.cuh
+ *          +-- hybrid: hybrid_combine.cuh
+ *          |
+ *          v
+ *     reduce buffer
+ *          |
+ *          v
+ *     launch_combine_reduce_epilogue
+ *          |
+ *          v
+ *     combined_x in original token order
+ *
+ * main kernel 负责跨 rank 把数据推回 reduce buffer；epilogue 负责最终 reduce、bias、
+ * top-k weights 输出以及 expanded layout 的收口。
+ */
+
 class CombineRuntime final : public jit::LaunchRuntime<CombineRuntime> {
 public:
     struct Args {
@@ -45,6 +71,7 @@ public:
     static std::string generate_impl(const Args& args) {
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
+            // direct combine: 只有一个 scale-out 域，目标 rank 可通过 NVLink/World Gin 直接写 reduce buffer。
             header_name = "combine";
             func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.is_scaleup_nvlink,
@@ -58,6 +85,7 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
+            // hybrid combine: 先在目标节点内 scale-up 域收集，再由 forward warps 跨 scale-out 返回。
             header_name = "hybrid_combine";
             func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
@@ -108,6 +136,7 @@ static void __instantiate_kernel() {{
 
 static layout::TokenLayout get_combine_token_layout(
     const int& hidden, const int& elem_size, const int& num_topk) {
+    // combine buffer 不需要 dispatch 的 src metadata，但仍需要 topk weights metadata。
     return layout::TokenLayout(hidden * elem_size, 0, num_topk, false);
 }
 
@@ -130,11 +159,17 @@ static void* launch_combine(void* x,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
                             const at::cuda::CUDAStream& stream) {
-    // Maximize shared memory utilization
+    // 每个 warp 一个 TMA staging token。direct mode 尽量把 shared memory 填满；
+    // hybrid mode 必须与 dispatch 的 channel 数匹配，所以 warps = scaleup + forward。
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
 
-    // Decide warps
+    // hybrid combine 中:
+    //
+    //     scaleup_warps:  从 expert output 写入节点内 scale-up buffer
+    //     forward_warps:  等待 scale-up tail，规约/转发到 scale-out buffer
+    //
+    // num_channels 必须来自 dispatch handle，保证 linked-list/channel metadata 对齐。
     int num_scaleup_warps = 0, num_forward_warps = 0;
     if (num_scaleout_ranks > 1) {
         EP_HOST_ASSERT(num_channels % num_sms == 0 and
@@ -177,7 +212,8 @@ static void* launch_combine(void* x,
     const auto runtime = jit::compiler->build("combine", code);
     CombineRuntime::launch(runtime, args, stream);
 
-    // Return the buffer to be reduced
+    // 返回 epilogue 需要读取的 reduce buffer 起始地址。
+    // hybrid 下 buffer 前缀是 scale-up 中间区，最终 reduce buffer 在其后。
     if (num_scaleout_ranks == 1)
         return buffer;
 
@@ -216,6 +252,8 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        // reduce epilogue 只依赖输出 token 数、hidden/topk/topology/layout 策略，
+        // 不需要 NCCL handle，因为所有跨 rank 数据在 main combine kernel 后已经落在本地 buffer。
         return fmt::format(R"(
 #include <deep_ep/impls/combine_reduce_epilogue.cuh>
 
@@ -258,8 +296,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& num_sms, const int& num_smem_bytes,
                                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
                                            const at::cuda::CUDAStream& stream) {
-    // Maximize shared memory utilization
-    // Too many warps may cause performance degrade, so we limit into 1024
+    // epilogue 做纯本地 reduce/copy，使用全 SM；每个 warp 在 shared memory 放一个输出 token。
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);
     const auto num_warps = std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
     const auto num_threads = num_warps * 32;

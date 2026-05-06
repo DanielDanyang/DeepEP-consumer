@@ -11,6 +11,29 @@
 
 namespace deep_ep::jit {
 
+/*
+ * JIT launch runtime 模板。
+ *
+ * 每个 elastic wrapper 都定义:
+ *
+ *     struct Args
+ *     static std::string generate_impl(const Args&)
+ *     static void launch_impl(kernel, config, Args)
+ *
+ * LaunchRuntime 提供公共流程:
+ *
+ *     generate(args)
+ *          |
+ *          +-- Derived::generate_impl
+ *          +-- include_parser 计算 impl/common header hash
+ *          +-- prepend hash comment 到源码，参与 cache key
+ *
+ *     launch(runtime, args, stream)
+ *          |
+ *          +-- construct_launch_config
+ *          +-- Derived::launch_impl
+ */
+
 struct LaunchArgs {
     std::pair<int, int> grid_dim;
     int num_threads;
@@ -33,10 +56,9 @@ public:
     static std::string generate(const Args& args) {
         auto code = Derived::generate_impl(args);
 
-        // NOTES: we require that `generate_impl`'s includes never change
-        static std::string include_hash;
-        if (include_hash.empty())
-            include_hash = include_parser->get_hash_value(code);
+        // 按当前 generated source 重新计算 include hash。Dispatch/Combine wrapper 会在
+        // direct/hybrid 分支包含不同 impl header，不能把 include_hash 做成 Derived 级静态缓存。
+        const auto include_hash = include_parser->get_hash_value(code);
 
         // TODO: optimize string concat performance
         code = fmt::format("// Includes' hash value: {}\n{}", include_hash, code);
@@ -60,7 +82,7 @@ public:
                                               grid_dim, block_dim, launch_args.cluster_dim,
                                               launch_args.cooperative, launch_args.pdl_enabled);
 
-        // Launch in the derived class
+        // 具体 kernel 参数列表由 Derived::launch_impl 展开。
         if (get_env<int>("EP_JIT_DEBUG")) {
             printf("Launch kernel with {%d, %d} x %d (cooperative: %d), shared memory: %d bytes, cluster: %d, stream: %ld\n",
                    launch_args.grid_dim.first, launch_args.grid_dim.second, launch_args.num_threads,

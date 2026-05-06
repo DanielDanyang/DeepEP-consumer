@@ -10,6 +10,37 @@
 
 namespace deep_ep::elastic::comm {
 
+/*
+ * 通信同步公共逻辑。
+ *
+ * v2 kernel 里的跨 rank 同步通常走两层:
+ *
+ *     local/grid sync
+ *          |
+ *          v
+ *     scale-up barrier   (NVLink LSA 或 World Gin)
+ *     scale-out barrier  (Rail Gin)
+ *          |
+ *          v
+ *     local/grid sync
+ *
+ * 关键设计:
+ *   - QP 分配由 get_qp_mode 决定，notify warp 可独占 QP0。
+ *   - barrier 前可 flush TMA stores / Gin QPs，保证 peer 看到数据。
+ *   - timeout_while 在 GPU 上打印定位信息后 trap，避免 silent hang。
+ *
+ * hybrid barrier 示意:
+ *
+ *     SM0              SM1..SMn
+ *      |                  |
+ *      v                  v
+ *   scale-up          scale-out
+ *   barrier           barrier
+ *      \              /
+ *       \            /
+ *        grid sync all SMs
+ */
+
 static constexpr int64_t kNumOneSecCycles = 2000000000;  // An approximation of the GPU clock at 2000 MHz
 
 // Some reserved tags
@@ -30,6 +61,8 @@ static constexpr int kFlushAllAllocatedQPs = -1;
 template <int64_t kNumTimeoutCycles, typename func_t>
 __device__ __forceinline__ void timeout_while(const bool& condition, const func_t& func,
                                               int64_t start_clock = 0) {
+    // func(is_last_check) 返回 true 表示等待完成。超时最后一次会让调用方打印上下文，
+    // 然后额外等待 1 秒，让其他线程也有机会打印，再 trap。
     // User may share a start clock for multiple waits
     if (start_clock == 0)
         start_clock = clock64();
@@ -56,6 +89,13 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
 __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mode(
     const int& sm_idx, const int& channel_in_sm_idx, const bool& is_notify_warp = false) {
+    // QP 映射策略:
+    //
+    //     notify warp -> QP0 + CTA sharing
+    //     QP >= SM    -> 每个 SM 拿一组 QP，CTA sharing
+    //     QP < SM     -> 所有 SM/channel round-robin 共享 QP，GPU sharing
+    //
+    // 目标是在 doorbell 开销和 channel 并行度之间折中。
     constexpr auto kSharingCTA = NCCL_GIN_RESOURCE_SHARING_CTA;
     constexpr auto kSharingGrid = kNumSMs == 1 ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
 
@@ -90,6 +130,14 @@ __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
     const handle::NCCLGin& gin,
     const layout::WorkspaceLayout& workspace,
     const int& rank_idx, const int& sm_idx, const int& thread_idx) {
+    // NVLink barrier 只使用 SM0:
+    //
+    //     phase/sign 从 counter 低 bit 读取
+    //     each rank atomically adds +1 or -1 to peer signal
+    //     wait signal reaches target
+    //     counter++ toggles next phase/sign
+    //
+    // 使用正负交替可以复用两组 signal，避免每次 memset。
     // This barrier only uses 1 SM
     if (kNumSMs > 1 and sm_idx > 0)
         return;
@@ -136,6 +184,10 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
     const ncclDevComm_t& nccl_dev_comm,
     const int& scaleout_rank_idx, const int& scaleup_rank_idx, 
     const int& sm_idx, const int& thread_idx) {
+    // Gin barrier 分两步:
+    //
+    //   1. 可选 flush 所有 QP，保证之前 put/get/store 的 release 语义
+    //   2. QP0 对 team 内每个 rank 发 signal，并轮询 signal shadow/global table
     const auto global_warp_idx = sm_idx * kNumWarps + (thread_idx / 32);
     const int& rank_idx = (std::is_same_v<team_t, ncclTeamTagWorld>) ? scaleup_rank_idx : scaleout_rank_idx;
     const int num_qps = kNumQPs == kFlushAllAllocatedQPs ? nccl_dev_comm.ginContextCount : kNumQPs;
@@ -215,6 +267,11 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
                                             const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                             const int& sm_idx, const int& thread_idx,
                                             bool do_scaleout = true, bool do_scaleup = true) {
+    // 通用 barrier 编排器。调用方可控制:
+    //   kFlushStores  是否等待 TMA store / flush Gin QP
+    //   kSyncAtStart  barrier 前是否 grid sync
+    //   kSyncAtEnd    barrier 后是否 grid sync
+    //   do_scaleout/do_scaleup 运行时跳过某个子域
     // A general TMA store wait to prevent proxy memory issues
     if constexpr (kFlushStores) {
         ptx::tma_store_commit();

@@ -1,5 +1,20 @@
 #pragma once
 
+/*
+ * 编译期公共定义。
+ *
+ * 这个头被 host wrapper 和 device impl 同时包含，负责统一:
+ *
+ *     CUDA/Torch 半精度宏开关
+ *     SM90/FP8 兼容类型
+ *     topk_idx_t 位宽
+ *     scale-factor pack 类型
+ *     全局 channel 上限
+ *
+ * v2 大量 kernel 通过 JIT template specialization 固定 num_topk/topology/hidden，
+ * 但 topk index 的整数位宽仍由 EP_NUM_TOPK_IDX_BITS 编译期开关全局决定。
+ */
+
 // Make CLion CUDA indexing work
 #ifdef __CLION_IDE__
 #define __CUDA_ARCH__ 900
@@ -57,6 +72,7 @@ __device__ __forceinline__ longlong4_t make_longlong4_t(
 
 namespace deep_ep {
 
+// kEnableSM90Features 控制 FP8/TMA 等新指令路径是否可用；Python 暴露为 is_sm90_compiled。
 #ifndef DISABLE_SM90_FEATURES
 constexpr bool kEnableSM90Features = true;
 #else
@@ -71,6 +87,8 @@ template <> struct int_with_bits<64> { using type = int64_t; };
 
 using topk_idx_t = int_with_bits<EP_NUM_TOPK_IDX_BITS>::type;
 
+// FP8 scale factor 既可能按 fp32 暴露，也可能按 packed UE8M0x4 存储；
+// kernel 只关心它的字节大小和拷贝/stride。
 union sf_pack_t {
     float fp32;
     int ue8m0x4;

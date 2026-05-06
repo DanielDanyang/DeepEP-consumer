@@ -12,6 +12,25 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Pipeline-parallel send/recv JIT wrapper。
+ *
+ * PP primitive 只允许 ring 相邻 rank 通信:
+ *
+ *     prev <---- current ----> next
+ *
+ * buffer 四段布局:
+ *
+ *     [recv from prev][recv from next][send to prev][send to next]
+ *          each direction has num_max_inflight_tensors slots
+ *
+ * send:
+ *     wait remote recv slot release -> TMA copy x to local send slot -> RDMA put to peer recv slot
+ *
+ * recv:
+ *     wait local recv signal -> TMA copy recv slot to output tensor -> signal peer release
+ */
+
 class PPSendRuntime final : public jit::LaunchRuntime<PPSendRuntime> {
 public:
     struct Args {
@@ -72,7 +91,7 @@ static void launch_pp_send(const ncclDevComm_t& nccl_dev_comm,
                            const int64_t& num_timeout_cycles,
                            const int& num_smem_bytes,
                            const at::cuda::CUDAStream& stream) {
-    // Generate, build and launch
+    // 一个 CTA/SM 只有一个 warp，但 grid 可有多个 SM；tma_copy 内部按 SM 切分 tensor bytes。
     const PPSendRuntime::Args args = {
         .num_ranks = num_ranks,
         .num_smem_bytes = num_smem_bytes,
@@ -157,7 +176,7 @@ static void launch_pp_recv(const ncclDevComm_t& nccl_dev_comm,
                            const int64_t& num_timeout_cycles,
                            const int& num_smem_bytes,
                            const at::cuda::CUDAStream& stream) {
-    // Generate, build and launch
+    // recv 与 send 使用同一套 slot 计数协议，只是方向相反。
     const PPRecvRuntime::Args args = {
         .num_ranks = num_ranks,
         .num_smem_bytes = num_smem_bytes,

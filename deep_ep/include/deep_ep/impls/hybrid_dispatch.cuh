@@ -10,6 +10,54 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Hybrid dispatch main kernel。
+ *
+ * 适用场景:
+ *   num_scaleout_ranks > 1。通信拆成跨节点 scale-out 和节点内 scale-up 两段。
+ *
+ * warp roles:
+ *
+ *     +-----------------------------+
+ *     | notify warps                |
+ *     | - local count               |
+ *     | - scale-out reduce counts   |
+ *     | - scale-up publish counts   |
+ *     | - prefix sums               |
+ *     +-----------------------------+
+ *     | scaleout sender warps       |
+ *     | - read local token          |
+ *     | - write local scaleout recv |
+ *     | - RDMA put to remote node   |
+ *     | - publish channel tail      |
+ *     +-----------------------------+
+ *     | forward warps               |
+ *     | - wait scaleout channel tail|
+ *     | - load arrived token        |
+ *     | - forward into scale-up buf |
+ *     | - record replay metadata    |
+ *     +-----------------------------+
+ *
+ * 内存流:
+ *
+ *     source rank x
+ *          |
+ *          v
+ *     scaleout_send_buffer --RDMA--> scaleout_recv_buffer[channel]
+ *          |                                |
+ *          | local bypass                   v
+ *          +------------------------> forward warp
+ *                                           |
+ *                                           v
+ *                                  scaleup_buffer[dst scaleup rank]
+ *                                           |
+ *                                           v
+ *                                  dispatch_copy_epilogue
+ *
+ * token_metadata_at_forward 和 channel_linked_list 是给 hybrid_combine 重放路径用的，
+ * 所以 cached handle 必须保存它们。
+ */
+
 template <bool kDoCPUSync,
           bool kReuseSlotIndices,
           int kNumSMs,
@@ -102,7 +150,7 @@ hybrid_dispatch_impl(
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
     __syncwarp();
 
-    // Different warp roles
+    // 角色 1: notify warps，负责跨 scale-out/scale-up 的 count 聚合与 prefix sum。
     if (warp_idx < kNumNotifyWarps) {
         // Assign shared memory
         constexpr int kNumAlignedElems = kNumSmemBytesForNotify / sizeof(int);
@@ -170,7 +218,7 @@ hybrid_dispatch_impl(
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
-            // Issue scaleout writes to peers
+            // 先把本 scale-out rank 观察到的 rank/expert counts 写到其他 scale-out peers。
             EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
             if (thread_idx < kNumScaleoutRanks) {
@@ -187,7 +235,7 @@ hybrid_dispatch_impl(
             }
             __syncwarp();
 
-            // Util functions to get metadata from scale-out peers
+            // 从所有 scale-out peers 收集同一 scale-up lane 的计数并做 reduce。
             // NOTES: this is correct as RDMA operations has a minimum write granularity of 1024 bytes (a whole integer write is atomic)
             const auto recv_and_reduce = [=](const auto& get_ptr_func, const bool& is_expert_reduction = false) -> int {
                 int count = 0;
@@ -217,7 +265,7 @@ hybrid_dispatch_impl(
                 return count;
             };
 
-            // Write into all scale-up peers' rank-level counters
+            // rank-level count: 每个 scale-up peer 需要知道它将从本 scale-out 域收到多少 token。
             #pragma unroll
             for (int i = thread_idx; i < kNumScaleupRanks; i += kNumNotifyThreads) {
                 // Wait scale-out arrival and reduce
@@ -233,7 +281,7 @@ hybrid_dispatch_impl(
             }
             __syncwarp();
 
-            // Atomic add into all scale-up peers' expert-level counters
+            // expert-level count: 写到对应 owning scale-up rank 的 expert counter。
             #pragma unroll
             for (int i = thread_idx; i < kNumExpertsPerScaleout; i += kNumNotifyThreads) {
                 // Wait scale-out arrival and reduce
@@ -255,7 +303,7 @@ hybrid_dispatch_impl(
             // NOTES: from now on, the `rank` and `expert`s size change into the local size
             expert_count = rank_expert_count + kNumScaleupRanks;
 
-            // Wait local counters to be ready
+            // 等所有 scale-up peers 对本 rank 的 count 聚合完成，并写 host workspace / stats。
             // NOTES: here we only care the prefix sum by scale-up peers (used for later epilogue), not all ranks
             EP_STATIC_ASSERT(kNumNotifyWarps == 0 or kNumScaleupRanks + kNumExpertsPerRank <= kNumNotifyWarps * 32,
                              "Insufficient notify threads");
@@ -294,7 +342,7 @@ hybrid_dispatch_impl(
             });
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
-            // Do prefix sum by the warps of the first SM
+            // 输出给 dispatch_copy_epilogue 的 prefix sums。
             // NOTES: we may have fast implementation with `cub::BlockScan`, but it is too heavy to use
             const auto do_psum = [=](const int* count, int* out, const int n, const int is_exclusive) {
                 int psum = 0;
@@ -322,12 +370,13 @@ hybrid_dispatch_impl(
             }
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
+        // 角色 2: scaleout sender warps。每个 channel 处理 token_idx = channel_idx mod kNumChannels。
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
         const int channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
 
-        // Channel metadata maintenance
+        // channel tail 以 (finish_flag, tail) 打包成 int64，通过 scale-out RDMA 原子加发布。
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid number of scale-out ranks");
         int stored_scaleout_tail = 0, stored_old_scaleout_tail = 0;
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
@@ -345,7 +394,7 @@ hybrid_dispatch_impl(
             __syncwarp();
         };
 
-        // Preload next token
+        // 预取下一 token 的 payload/SF，与当前 token 的 RDMA issue 重叠。
         const auto preload_next_token = [&](const int& token_idx) {
             if (token_idx >= num_tokens)
                 return;
@@ -403,7 +452,7 @@ hybrid_dispatch_impl(
             ptx::tma_store_fence();
             __syncwarp();
 
-            // Deduplicate ranks and assign slots
+            // 对 scale-out rank 去重并分配该 channel 的 slot。
             int stored_dst_slot_idx = -1;
             const auto stored_old_slot_idx = ptx::exchange(
                 stored_scaleout_tail, stored_dst_scaleout_rank_idx >= 0 ? stored_dst_scaleout_rank_idx : 0);
@@ -439,7 +488,7 @@ hybrid_dispatch_impl(
             // Preload the next token (overlapping with the IBGDA issues)
             preload_next_token(token_idx + kNumChannels);
 
-            // Issue IBGDA requests
+            // 非本 scale-out rank 时通过 Gin put 发送到对端 scaleout_recv_buffer。
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
                 gin.put<ncclTeamTagRail>(
                         scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
@@ -454,9 +503,11 @@ hybrid_dispatch_impl(
             update_scaleout_tail();
         }
 
-        // Flush unflushed tails
+        // 发送 finish tail，通知 forward warps 这个 channel 不会再有新 token。
         update_scaleout_tail(true);
     } else {
+        // 角色 3: forward warps。等待每个 scale-out peer 的 channel tail，把 token 转发到
+        // 目标 scale-up rank 的 buffer，并记录 combine 可重放的 metadata。
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
@@ -476,7 +527,7 @@ hybrid_dispatch_impl(
                 idx * kNumScaleupRanks + scaleup_rank_idx;
         };
 
-        // Forward tokens from scale-out ranks
+        // 轮询所有 scale-out peers 的 tail，按 round-robin 取 ready token，避免某一 peer 饿死。
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Too many scale-out ranks");
         int num_tokens_processed = 0;
         int stored_scaleout_old_tail_idx = 0;
@@ -546,7 +597,7 @@ hybrid_dispatch_impl(
                 }
                 __syncwarp();
 
-                // Read top-k indices
+                // 当前 destination scale-out 已固定，继续把 expert id 映射到 scale-up rank。
                 EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
                 int stored_dst_scaleup_rank_idx = -1;
                 auto dst_expert_idx = lane_idx < kNumTopk ? tma_buffer.get_topk_idx_ptr()[lane_idx] : -1;
@@ -554,7 +605,7 @@ hybrid_dispatch_impl(
                 stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
                     dst_expert_idx / kNumExpertsPerRank : -1;
 
-                // Write the per-scaleup channel index for this token
+                // 为 combine 构建 per-scaleup linked-list 的节点索引。
                 int linked_list_idx = -1;
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
@@ -570,7 +621,7 @@ hybrid_dispatch_impl(
                 }
                 __syncwarp();
 
-                // Deduplicate for scale-up ranks
+                // 对 scale-up rank 去重并分配该 scale-up peer 的 slot。
                 int stored_dst_slot_idx = -1;
                 const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
                     recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
@@ -604,7 +655,7 @@ hybrid_dispatch_impl(
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                     stored_scaleup_send_counters[j] += (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
 
-                // Record metadata at forward
+                // 记录 forward metadata，hybrid_combine 会按同样顺序重放 scale-up -> scale-out。
                 if constexpr (not kReuseSlotIndices) {
                     EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of selections");
                     const auto metadata_ptr = token_metadata_at_forward +
@@ -628,12 +679,12 @@ hybrid_dispatch_impl(
             }
         }
 
-        // Assign the source token index part of the metadata into `-1` as an ending mark
+        // metadata 结束标记。
         if (not kReuseSlotIndices and ptx::elect_one_sync())
             token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims] = -1;
         __syncwarp();
 
-        // Update linked list's ending position
+        // linked list tail 发布给 dispatch_copy_epilogue，后者会写 -1 结束节点。
         if constexpr (not kReuseSlotIndices) {
             const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
             #pragma unroll
@@ -653,7 +704,7 @@ hybrid_dispatch_impl(
         __syncwarp();
     }
 
-    // Scale-up barrier to ensure data arrival
+    // 只需要 scale-up barrier: scale-out buffer 已经被 forward warps 消费完毕。
     // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(

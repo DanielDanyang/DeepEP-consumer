@@ -9,6 +9,34 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * Combine reduce epilogue。
+ *
+ * 输入:
+ *   combine main kernel 已经写好的本地 reduce buffer。
+ *
+ * 输出:
+ *   combined_x[token, hidden]，顺序回到原始 token order。
+ *
+ * 流程:
+ *
+ *     reduce buffer
+ *          |
+ *          v
+ *     cudaGridDependencySynchronize()
+ *          |
+ *          v
+ *     for token in original order:
+ *         read combined_topk_idx
+ *         decide valid rank/topk slots
+ *         combine_reduce(...)
+ *         TMA store to combined_x
+ *         optional combined_topk_weights
+ *
+ * hybrid 和 direct 共用这一个 epilogue，差别通过 kNumScaleoutRanks/kNumScaleupRanks
+ * 和 layout 策略在编译期固定。
+ */
+
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs, int kNumWarps,
           // TODO: merge these two variables into one (ensure the whole file does not contain "scaleup")
@@ -54,13 +82,13 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     const auto bias_0_buffer = layout::BufferLayout<false>(output_token_layout, 1, num_combined_tokens, bias_0);
     const auto bias_1_buffer = layout::BufferLayout<false>(output_token_layout, 1, num_combined_tokens, bias_1);
 
-    // Will block until the main combine kernel has finished and all data are visible
+    // 等待 combine main kernel 完成 Programmatic Dependent Launch。
     // NOTES: PDL is used, please do not use `__ldg`
     cudaGridDependencySynchronize();
 
     // Read from buffers and do reduction
     for (int token_idx = global_warp_idx; token_idx < num_combined_tokens; token_idx += kNumWarps * kNumSMs) {
-        // Preprocess all indices
+        // 根据原始 top-k expert id 判断本 token 需要从 reduce buffer 的哪些 slot 取数。
         int stored_dst_rank_idx = -1, stored_dst_expert_idx = -1;
         EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
         if (lane_idx < kNumTopk) {
@@ -70,7 +98,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         }
         __syncwarp();
 
-        // Sort valid top-k indices to front
+        // 对同一 rank/scaleout rank 的重复 top-k 做去重，避免重复规约同一份 buffer。
         const auto [should_deduplicate, deduplicate_key] = [&]() -> std::pair<bool, int> {
             if constexpr (kUseExpandedLayout and not kAllowMultipleReduction) {
                 // Activations are never reduced before
@@ -94,7 +122,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
             }
         );
 
-        // Iterate over per-hidden-chunk stage
+        // 规约 hidden 向量，并把结果暂存在 shared memory token slot。
         using combine_vec_t = typename CombineVecTraits<kHidden * sizeof(nv_bfloat16)>::vec_t;
         constexpr int kHiddenVec = kHidden * sizeof(nv_bfloat16) / sizeof(combine_vec_t);
         constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
@@ -116,7 +144,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         ptx::tma_store_fence();
         __syncwarp();
 
-        // Issue TMA copy
+        // 写最终 combined_x。
         if (ptx::elect_one_sync()) {
             ptx::tma_store_1d(output_buffer.get_token_buffer(token_idx).get_base_ptr(),
                               tma_buffer.get_base_ptr(), kNumHiddenBytes);
@@ -124,7 +152,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         }
         __syncwarp();
 
-        // Write top-k weights
+        // 如果用户传入 topk_weights，按 master lane 从 reduce buffer metadata 取回。
         if (combined_topk_weights != nullptr) {
             const auto master_lane_idx = ptx::get_master_lane_idx(ptx::match(stored_dst_rank_idx));
             if (lane_idx < kNumTopk) {

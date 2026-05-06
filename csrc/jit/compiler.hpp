@@ -19,6 +19,39 @@
 
 namespace deep_ep::jit {
 
+/*
+ * JIT compiler。
+ *
+ * v2 launch wrapper 生成的源码很小，通常只有:
+ *
+ *     #include <deep_ep/impls/foo.cuh>
+ *     static void __instantiate_kernel() {
+ *         auto ptr = reinterpret_cast<void*>(&foo_impl<template args...>);
+ *     }
+ *
+ * Compiler 负责把这段源码编译成 cubin，并用稳定 cache key 复用结果。
+ *
+ * cache key:
+ *
+ *     kernel name + compiler signature + flags + generated source
+ *
+ * 磁盘流程:
+ *
+ *     build(name, code)
+ *          |
+ *          +-- process/disk cache hit -> KernelRuntime
+ *          |
+ *          +-- miss:
+ *                tmp dir / kernel.cu
+ *                nvcc -> kernel.cubin
+ *                optional ptx/sass dump
+ *                fsync tmp dir
+ *                atomic rename tmp -> cache/kernel.<name>.<hash>
+ *                load KernelRuntime
+ *
+ * 使用目录级 atomic rename 是为了多 rank 同时编译时不读到半写入文件。
+ */
+
 class Compiler {
 public:
     static std::filesystem::path library_root_path;
@@ -30,7 +63,7 @@ public:
     static void prepare_init(const std::string& library_root_path,
                              const std::string& cuda_home_path_by_python,
                              const std::string& nccl_root_path_by_python) {
-        // NOTES: if you are adding some third-party includes for kernels, please add its hash value
+        // 如果 JIT kernel 新增第三方 include，需要把对应内容纳入 hash，否则 cache 可能误命中。
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::cuda_home = cuda_home_path_by_python;
@@ -48,12 +81,12 @@ public:
         EP_HOST_ASSERT(not nccl_root.empty());
         EP_HOST_ASSERT(not cuobjdump_path.empty());
 
-        // Cache settings
+        // 默认 cache 在 ~/.deep_ep，可用 EP_JIT_CACHE_DIR 覆盖。
         cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_ep";
         if (const auto env_cache_dir_path = get_env<std::string>("EP_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
             cache_dir_path = env_cache_dir_path;
 
-        // The compiler flags applied to all derived compilers
+        // 基础 flags 会进入 signature，因此环境变量变化会导致新的 cache key。
         signature = "unknown-compiler";
         flags = fmt::format("-std=c++{} --diag-suppress=39,161,174,177,186,940,3012 "
                             "--ptxas-options=--register-usage-level=10",
@@ -86,8 +119,7 @@ public:
         }
     }
 
-    // Recursively fsync a directory: files and subdirectories first (bottom-up), then the directory itself
-    // NOTES: ensures data and directory entries are visible on other nodes in distributed filesystems
+    // 递归 fsync: 先文件/子目录，再目录本身。分布式文件系统上 close() 不一定足够。
     static void fsync_dir(const std::filesystem::path& dir_path) { // NOLINT(*-no-recursion)
         for (const auto& entry: std::filesystem::directory_iterator(dir_path)) {
             if (entry.is_directory())
@@ -112,13 +144,11 @@ public:
         const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
-        // Hit the runtime cache
+        // 先查进程内 cache / 磁盘 cache。
         if (const auto runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
             return runtime;
 
-        // Compile into a temporary directory, then atomically rename the whole directory
-        // NOTES: renaming a directory is atomic on both local and distributed filesystems,
-        // avoiding the stale inode issue that occurs when renaming individual files
+        // miss 后在 tmp dir 中完整编译，再原子 rename 成最终 cache dir。
         const auto tmp_dir_path = make_tmp_dir() / get_uuid();
         make_dirs(tmp_dir_path);
 
@@ -137,7 +167,7 @@ public:
             disassemble(tmp_cubin_path, tmp_sass_path);
         }
 
-        // Fsync before rename to ensure visibility on distributed filesystems
+        // rename 前 fsync，保证其他 rank rename 后能看到完整内容。
         fsync_dir(tmp_dir_path);
 
         // Atomically rename the temporary directory to the final cache path
@@ -146,10 +176,7 @@ public:
         std::error_code error_code;
         std::filesystem::rename(tmp_dir_path, dir_path, error_code);
         if (error_code) {
-            // Another rank beat us, then clean up our dir and use the existing one
-            // NOTES: avoid `std::filesystem::remove_all` here — it can segfault on
-            // distributed filesystems, when concurrent processes operate
-            // on the same parent directory, causing stale directory entries
+            // 其他 rank 先完成了编译，清理自己的 tmp dir 并复用已有 cache。
             safe_remove_all(tmp_dir_path);
         }
 
@@ -202,7 +229,7 @@ class NVCCCompiler final: public Compiler {
 
 public:
     NVCCCompiler() {
-        // Override the compiler signature
+        // NVCC 版本和 GPU arch 都影响 cubin，所以进入 compiler signature/flags。
         nvcc_path = cuda_home / "bin" / "nvcc";
         cuobjdump_path = cuda_home / "bin" / "cuobjdump";
         if (const auto env_nvcc_path = get_env<std::string>("EP_JIT_NVCC_COMPILER"); not env_nvcc_path.empty())
@@ -210,8 +237,7 @@ public:
         const auto [nvcc_major, nvcc_minor] = get_nvcc_version();
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
-        // The override the compiler flags
-        // Only NVCC >= 12.9 supports arch-specific family suffix
+        // NVCC >= 12.9 支持 arch family suffix；Blackwell/SM100 需要 100a/100f 区分。
         const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
         flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
@@ -222,12 +248,11 @@ public:
     void compile(const std::string &code, const std::filesystem::path& dir_path,
                  const std::filesystem::path &cubin_path,
                  const std::optional<std::filesystem::path> &ptx_path) const override {
-        // Write the code into the cache directory
+        // 写 kernel.cu，失败时保留 tmp 目录便于 EP_JIT_DEBUG 排查。
         const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
-        // Compile to CUBIN
-        // Avoid cwd files shadowing C++ standard library headers
+        // 使用独立 compile_dir，避免当前工作目录里的文件遮蔽 C++ 标准库头。
         const auto compile_dir = make_tmp_dir();
         const auto command = fmt::format("cd {} && {} {} -cubin -o {} {}",
             compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
@@ -252,7 +277,7 @@ public:
             }
         }
 
-        // Check local memory usage
+        // 可选检查 ptxas 是否使用 local memory；高性能 kernel 通常不希望 spill。
         if (get_env("EP_JIT_PTXAS_CHECK", 0))
             EP_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));
 

@@ -4,6 +4,21 @@
 #include <string>
 #include <sstream>
 
+/*
+ * DeepEP host/device 断言和错误包装。
+ *
+ * host path:
+ *     EP_HOST_ASSERT / CUDA_RUNTIME_CHECK / NCCL_CHECK
+ *         -> throw EPException(file:line + message)
+ *
+ * device path:
+ *     EP_DEVICE_ASSERT
+ *         -> printf + trap
+ *
+ * JIT kernel 中大量错误只能在 GPU 上发现，所以 device assert 会直接 trap，
+ * 外层 launch wrapper 通过 EP_CUDA_UNIFIED_CHECK/CUDA runtime 错误传播给 Python。
+ */
+
 #ifndef EP_STATIC_ASSERT
 #define EP_STATIC_ASSERT(cond, reason) static_assert(cond, reason)
 #endif

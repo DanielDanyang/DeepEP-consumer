@@ -8,6 +8,29 @@
 
 namespace deep_ep::elastic {
 
+/*
+ * PP send/recv device kernels。
+ *
+ * ring buffer 视图:
+ *
+ *     local rank buffer
+ *       +-- recv slot from prev
+ *       +-- recv slot from next
+ *       +-- send slot to prev
+ *       +-- send slot to next
+ *
+ * slot 计数:
+ *
+ *     send_count: 本 rank 已向某方向发送多少 tensor
+ *     recv_count: 本 rank 已从某方向接收多少 tensor
+ *
+ * send wait 条件:
+ *     peer 已释放 slot，即 remote release signal >= send_count - inflight + 1
+ *
+ * recv wait 条件:
+ *     local arrival signal >= recv_count + 1
+ */
+
 template <int kNumRanks>
 __device__ __forceinline__ std::pair<int, int> get_buffer_offset(
     const int& src_rank_idx, const int& dst_rank_idx) {
@@ -44,6 +67,13 @@ template <int kNumSMs,
 __device__ __forceinline__ void tma_copy(
     void* src_ptr, void* dst_ptr,
     const int64_t& num_bytes, const int& sm_idx) {
+    // 多 SM TMA pipeline:
+    //
+    //     split bytes into 32B TMA blocks
+    //     each SM owns a block range
+    //     kNumStages shared-memory buffers overlap load/store
+    //
+    // send/recv 都复用它搬运用户 tensor <-> PP ring slot。
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     const auto tma_buffers = smem;
     const auto mbarriers = reinterpret_cast<ptx::mbarrier*>(smem + kNumStages * kNumTMABytesPerStage);
@@ -128,7 +158,7 @@ pp_send_impl(const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
     // Gin handle
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
 
-    // Buffer offsets
+    // 选择本次发送使用的 circular slot。
     const auto send_count_ptr = workspace_layout.get_pp_send_count_ptr(dst_idx_in_local);
     const auto send_count = __ldg(send_count_ptr);
     const auto slot_idx = send_count % num_max_inflight_tensors;
@@ -137,7 +167,7 @@ pp_send_impl(const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
     auto recv_buffer_ptr = math::advance_ptr(
         buffer, ((local_idx_in_dst + 0) * num_max_inflight_tensors + slot_idx) * num_max_tensor_bytes);
 
-    // Wait buffer slot release and do TMA
+    // 等 peer 释放对应 recv slot，再把 x 拷到本地 send slot。
     if (ptx::elect_one_sync()) {
         check_signal<kNumTimeoutCycles>(
             gin,
@@ -150,7 +180,7 @@ pp_send_impl(const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
     }
     cooperative_groups::this_grid().sync();
 
-    // Issue RDMA put
+    // 由 SM0 发 RDMA put 到 peer recv slot，并 signal peer arrival。
     if (sm_idx == 0 and ptx::elect_one_sync()) {
         gin.put<ncclTeamTagWorld>(
             recv_buffer_ptr,
@@ -181,14 +211,14 @@ pp_recv_impl(const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
     // Gin handle
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
 
-    // Buffer offsets
+    // 选择本次接收读取的 circular slot。
     const auto recv_count_ptr = workspace_layout.get_pp_recv_count_ptr(src_idx_in_local);
     const auto recv_count = __ldg(recv_count_ptr);
     const auto slot_idx = recv_count % num_max_inflight_tensors;
     const auto recv_buffer_ptr = math::advance_ptr(
         buffer, ((src_idx_in_local + 0) * num_max_inflight_tensors + slot_idx) * num_max_tensor_bytes);
 
-    // Copy from the buffer into a new tensor
+    // 等发送方 arrival signal，再从本地 recv slot 拷到用户输出 tensor。
     if (ptx::elect_one_sync()) {
         check_signal<kNumTimeoutCycles>(
             gin,
@@ -201,7 +231,7 @@ pp_recv_impl(const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
     }
     cooperative_groups::this_grid().sync();
 
-    // TODO: add a comment
+    // 通知发送方该 slot 已释放，并推进本地 recv_count。
     if (sm_idx == 0 and ptx::elect_one_sync()) {
         gin.signal<ncclTeamTagWorld>(
             src_rank_idx, ncclGin_SignalInc(static_cast<ncclGinSignal_t>(kNumRanks + local_idx_in_src + 2))

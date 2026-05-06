@@ -10,6 +10,23 @@
 
 namespace deep_ep::jit {
 
+/*
+ * 已编译 cubin 的加载与生命周期。
+ *
+ * cache directory:
+ *
+ *     kernel.<name>.<hash>/
+ *       +-- kernel.cu
+ *       +-- kernel.cubin
+ *       +-- optional kernel.ptx/kernel.sass
+ *
+ * KernelRuntime 做两件事:
+ *   1. 用 cuobjdump 找到唯一的 entry kernel symbol
+ *   2. load_kernel(cubin, symbol) 得到 CUDA function handle
+ *
+ * JIT 生成源码中的 __instantiate_kernel 只是为了强制模板实例化，不应被当成 entry。
+ */
+
 class KernelRuntime final {
 public:
     static std::filesystem::path cuda_home;
@@ -26,7 +43,7 @@ public:
         if (get_env<int>("EP_JIT_DEBUG"))
             printf("Loading CUBIN: %s\n", cubin_path.c_str());
 
-        // Find the only symbol
+        // 找 cubin 中唯一真正的 __global__ entry symbol。
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
         const auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
@@ -42,7 +59,7 @@ public:
             }
         }
 
-        // Print symbols
+        // 如果多于/少于一个 entry，说明 cache 目录或生成代码异常。
         if (symbol_names.size() != 1) {
             printf("Corrupted JIT cache directory (expected 1 kernel symbol, found %zu): %s, "
                    "please run `rm -rf %s` and restart your task.\n",

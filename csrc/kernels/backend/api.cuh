@@ -7,6 +7,26 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+/*
+ * Backend API declarations。
+ *
+ * v2 elastic 主路径主要使用 deep_ep::nccl:
+ *
+ *     host ncclComm_t
+ *          |
+ *          v
+ *     NCCLSymmetricMemoryContext
+ *          |
+ *          +-- ncclDevComm_t        device-side Gin communicator
+ *          +-- ncclWindow_t         symmetric memory window
+ *          +-- mapped_window_ptr    local LSA mapped pointer
+ *          +-- nvl_window_ptrs      NVLink peer symmetric pointers
+ *
+ * legacy V1 仍保留 deep_ep::nvshmem API；elastic 不沿用 legacy buffer/kernel。
+ *
+ * cuda_driver helpers 用于 host 侧批量写/等 signal，例如 AGRS session 完成同步。
+ */
+
 // TODO: make a unified API
 namespace deep_ep::nvshmem {
 
@@ -43,7 +63,7 @@ std::tuple<int, int> get_logical_domain_size(const int64_t& nccl_comm, const boo
 // TODO: make it header only?
 struct NCCLSymmetricMemoryContext {
 private:
-    // Can not use this unmapped pointer from outside
+    // 原始 NCCL allocation pointer 只用于 deregister/free；外部使用 mapped_window_ptr。
     void* raw_window_ptr;
 
 public:
