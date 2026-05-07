@@ -56,7 +56,9 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
 
     // Will block until the main dispatch kernel has finished and all data are visible
     // NOTES: PDL is used, please do not use `__ldg`
+#ifndef DISABLE_SM90_FEATURES
     cudaGridDependencySynchronize();
+#endif
 
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
@@ -85,11 +87,16 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
 
         // Issue TMA loads
         // Including all stuffs: data, SF, top-k metadata
+#ifndef DISABLE_SM90_FEATURES
         if (ptx::elect_one_sync()) {
             ptx::tma_load_1d(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
                              mbarrier_ptr, tma_buffer.get_num_bytes<false>());
             ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, tma_buffer.get_num_bytes<false>());
         }
+#else
+        ptx::tma_load_1d_warp(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
+                              tma_buffer.get_num_bytes<false>());
+#endif
         __syncwarp();
 
         // Load target expert indices separately to tolerate TMA load latency
@@ -130,11 +137,25 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
 
         // Issue TMA stores for data
+#ifndef DISABLE_SM90_FEATURES
         if (kDoExpand ? (dst_tensor_idx >= 0) : ptx::elect_one_sync()) {
             ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
                               tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
             ptx::tma_store_commit();
         }
+#else
+        if constexpr (kDoExpand) {
+            if (dst_tensor_idx >= 0) {
+                ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
+                                  tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                ptx::tma_store_commit();
+            }
+        } else {
+            ptx::tma_store_1d_warp(math::advance_ptr(recv_x, static_cast<int64_t>(i) * kNumHiddenBytes),
+                                   tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+            ptx::tma_store_commit();
+        }
+#endif
         __syncwarp();
 
         // Store SF

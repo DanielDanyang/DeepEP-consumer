@@ -56,7 +56,9 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
 
     // Will block until the main combine kernel has finished and all data are visible
     // NOTES: PDL is used, please do not use `__ldg`
+#ifndef DISABLE_SM90_FEATURES
     cudaGridDependencySynchronize();
+#endif
 
     // Read from buffers and do reduction
     for (int token_idx = global_warp_idx; token_idx < num_combined_tokens; token_idx += kNumWarps * kNumSMs) {

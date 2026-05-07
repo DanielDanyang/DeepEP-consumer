@@ -49,12 +49,20 @@ public:
     std::string get_arch(const bool& number_only = false,
                          const bool& support_arch_family = false) {
         const auto [major, minor] = get_arch_pair();
+        const auto arch_number = std::to_string(major * 10 + minor);
+        if (number_only)
+            return arch_number;
         if (major == 10 and minor != 1) {
-            if (number_only)
-                return "100";
             return support_arch_family ? "100f" : "100a";
         }
-        return std::to_string(major * 10 + minor) + (number_only ? "" : "a");
+        // Only architectures with a distinct PTX ISA family should receive
+        // NVIDIA's family suffix.  L4 is SM89/Ada and nvcc rejects `sm_89a`;
+        // forcing that suffix also incorrectly selects instructions intended
+        // for SM90+.  Keep Hopper on `sm_90a`, while compiling Ada and older
+        // devices to their plain numeric architecture.
+        if (major == 9 and minor == 0)
+            return "90a";
+        return arch_number;
     }
 
     int get_arch_major() {

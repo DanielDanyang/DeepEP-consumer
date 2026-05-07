@@ -274,6 +274,14 @@ static void launch_dispatch(void* x, void* sf,
     }
 
     // Generate, build and launch
+#if defined(DISABLE_SM90_FEATURES)
+    // Programmatic dependent launch and CTA clusters are Hopper-era launch
+    // features.  On L4/SM89 we rely on ordinary stream ordering between the
+    // dispatch kernel and its copy epilogue.
+    constexpr int cluster_dim = 1;
+#else
+    const int cluster_dim = 2 - (num_sms % 2);
+#endif
     const DispatchRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .do_cpu_sync = do_cpu_sync,
@@ -300,7 +308,7 @@ static void launch_dispatch(void* x, void* sf,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, cluster_dim, true)};
     const auto code = DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch", code);
     DispatchRuntime::launch(runtime, args, stream);
@@ -388,6 +396,11 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
     const auto num_threads = num_warps * 32;
 
     // Generate, build and launch
+#if defined(DISABLE_SM90_FEATURES)
+    constexpr bool enable_pdl = false;
+#else
+    constexpr bool enable_pdl = true;
+#endif
     const DispatchCopyEpilogueRuntime::Args args = {
         .do_expand = do_expand, .cached_mode = cached_mode,
         .num_channels = num_channels, .num_warps = num_warps,
@@ -405,7 +418,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .num_recv_tokens = num_recv_tokens,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)};
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, enable_pdl)};
     const auto code = DispatchCopyEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch_copy_epilogue", code);
     DispatchCopyEpilogueRuntime::launch(runtime, args, stream);

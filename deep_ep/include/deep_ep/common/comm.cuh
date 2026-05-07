@@ -186,6 +186,16 @@ __forceinline__ __device__ void scaleup_barrier_wo_local_sync(
     const handle::NCCLGin& gin,
     const layout::WorkspaceLayout& workspace,
     const int& rank_idx, const int& sm_idx, const int& thread_idx) {
+#if defined(DISABLE_SM90_FEATURES)
+    // SM89/L4 PCIe systems can expose the ranks through NCCL's LSA window even
+    // when native peer atomics are not available.  The NVLink barrier relies on
+    // remote release-system atomic adds to symmetric memory, so it can livelock
+    // or timeout on that topology.  Use Gin's device-side signal protocol for
+    // the scale-up barrier on non-SM90 builds; payload kernels can still use
+    // direct symmetric pointers where the selected data path proves them valid.
+    gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagWorld, kTag, kFlushStores>(
+        gin.nccl_dev_comm, 1, rank_idx, sm_idx, thread_idx);
+#else
     if constexpr (kIsScaleupNVLink) {
         nvlink_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumTimeoutCycles, kTag>(
             gin, workspace, rank_idx, sm_idx, thread_idx);
@@ -193,6 +203,7 @@ __forceinline__ __device__ void scaleup_barrier_wo_local_sync(
         gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagWorld, kTag, kFlushStores>(
             gin.nccl_dev_comm, 1, rank_idx, sm_idx, thread_idx);
     }
+#endif
 }
 
 template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag,

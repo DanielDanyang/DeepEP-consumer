@@ -53,28 +53,70 @@ __forceinline__ __device__ int elect_one_sync() {
 }
 
 /// TMA and `cp.async`
+__forceinline__ __device__ void sync_copy_bytes(void* dst_ptr, const void* src_ptr, const int& num_bytes) {
+    auto dst_vec = reinterpret_cast<int4*>(dst_ptr);
+    const auto src_vec = reinterpret_cast<const int4*>(src_ptr);
+    const int num_vecs = num_bytes / static_cast<int>(sizeof(int4));
+    for (int i = 0; i < num_vecs; ++ i)
+        dst_vec[i] = src_vec[i];
+
+    auto dst_byte = reinterpret_cast<uint8_t*>(dst_ptr) + num_vecs * sizeof(int4);
+    auto src_byte = reinterpret_cast<const uint8_t*>(src_ptr) + num_vecs * sizeof(int4);
+    for (int i = num_vecs * static_cast<int>(sizeof(int4)); i < num_bytes; ++ i)
+        *dst_byte++ = *src_byte++;
+}
+
+__forceinline__ __device__ void sync_copy_bytes_warp(void* dst_ptr, const void* src_ptr, const int& num_bytes) {
+    const auto active_mask = __activemask();
+    const auto lane_idx = get_lane_idx();
+    const auto active_rank = __popc(active_mask & ((1u << lane_idx) - 1));
+    const auto active_count = __popc(active_mask);
+
+    auto dst_vec = reinterpret_cast<int4*>(dst_ptr);
+    const auto src_vec = reinterpret_cast<const int4*>(src_ptr);
+    const int num_vecs = num_bytes / static_cast<int>(sizeof(int4));
+    for (int i = active_rank; i < num_vecs; i += active_count)
+        dst_vec[i] = src_vec[i];
+
+    if (active_rank == 0) {
+        auto dst_byte = reinterpret_cast<uint8_t*>(dst_ptr) + num_vecs * sizeof(int4);
+        auto src_byte = reinterpret_cast<const uint8_t*>(src_ptr) + num_vecs * sizeof(int4);
+        for (int i = num_vecs * static_cast<int>(sizeof(int4)); i < num_bytes; ++ i)
+            *dst_byte++ = *src_byte++;
+    }
+}
+
 __forceinline__ __device__ void mbarrier_init_with_fence(mbarrier* ptr, const int& arrive_count = 1) {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::
                  "r"(arrive_count), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
     asm volatile("fence.mbarrier_init.release.cluster;" ::);
+#endif
 }
 
 __forceinline__ __device__ void mbarrier_invalidate(mbarrier* ptr) {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+#endif
 }
 
 __forceinline__ __device__ void mbarrier_arrive(mbarrier* ptr) {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0]; \n\t" ::
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+#endif
 }
 
 __forceinline__ __device__ void mbarrier_arrive_and_set_tx(mbarrier* ptr, const int& num_bytes) {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t" ::
                  "r"(num_bytes), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+#endif
 }
 
 __forceinline__ __device__ void mbarrier_wait_and_flip_phase(mbarrier* ptr, arrival_phase& phase) {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile(
         "{\n\t"
         ".reg .pred       P1; \n\t"
@@ -86,16 +128,21 @@ __forceinline__ __device__ void mbarrier_wait_and_flip_phase(mbarrier* ptr, arri
         "}" ::
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
         "r"(phase), "r"(0x989680));
+#endif
     phase ^= 1;
 }
 
 __forceinline__ __device__ void tma_store_fence() {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("fence.proxy.async.shared::cta;");
+#endif
 }
 
 template <int kNumRemainingWaits = 0>
 __forceinline__ __device__ void tma_store_wait() {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(kNumRemainingWaits) : "memory");
+#endif
 }
 
 enum TMACacheHint: int64_t {
@@ -106,6 +153,7 @@ enum TMACacheHint: int64_t {
 __forceinline__ __device__ void tma_load_1d(
     const void* dst_ptr, const void* src_ptr, mbarrier* ptr, const int& num_bytes,
     const TMACacheHint& hint = TMACacheHint::kEvictFirst) {
+#ifndef DISABLE_SM90_FEATURES
     // NOTES: normally, the loaded part will be evicted soon
     asm volatile(
         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n" ::
@@ -115,11 +163,27 @@ __forceinline__ __device__ void tma_load_1d(
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
         "l"(hint)
         : "memory");
+#else
+    // L4/SM89 has no TMA or mbarrier.  The fallback is intentionally
+    // synchronous: callers already place warp sync points around these helpers,
+    // and correctness is more important than pretending async progress exists.
+    sync_copy_bytes(const_cast<void*>(dst_ptr), src_ptr, num_bytes);
+#endif
+}
+
+__forceinline__ __device__ void tma_load_1d_warp(
+    const void* dst_ptr, const void* src_ptr, const int& num_bytes) {
+#ifndef DISABLE_SM90_FEATURES
+    EP_DEVICE_ASSERT(false and "warp TMA fallback must only be used on non-SM90 builds");
+#else
+    sync_copy_bytes_warp(const_cast<void*>(dst_ptr), src_ptr, num_bytes);
+#endif
 }
 
 __forceinline__ __device__ void tma_store_1d(
     const void* dst_ptr, const void* src_ptr, const int& num_bytes,
     const TMACacheHint& hint = TMACacheHint::kEvictNormal) {
+#ifndef DISABLE_SM90_FEATURES
     // NOTES: normally, the stored part will be used soon
     asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;\n" ::
                  "l"(dst_ptr),
@@ -127,24 +191,46 @@ __forceinline__ __device__ void tma_store_1d(
                  "r"(num_bytes),
                  "l"(hint)
                  : "memory");
+#else
+    sync_copy_bytes(const_cast<void*>(dst_ptr), src_ptr, num_bytes);
+#endif
+}
+
+__forceinline__ __device__ void tma_store_1d_warp(
+    const void* dst_ptr, const void* src_ptr, const int& num_bytes) {
+#ifndef DISABLE_SM90_FEATURES
+    EP_DEVICE_ASSERT(false and "warp TMA fallback must only be used on non-SM90 builds");
+#else
+    sync_copy_bytes_warp(const_cast<void*>(dst_ptr), src_ptr, num_bytes);
+#endif
 }
 
 __forceinline__ __device__ void tma_store_commit() {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("cp.async.bulk.commit_group;");
+#else
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+#endif
 }
 
 template <class dtype_t>
 __forceinline__ __device__ void cp_async_ca(const dtype_t* gmem_src, const dtype_t* smem_dst) {
     EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8 or sizeof(dtype_t) == 16, "Invalid dtype bytes");
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("cp.async.ca.shared::cta.global.L2::128B [%0], [%1], %2;\n" ::
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst))),
                  "l"(gmem_src),
                  "n"(sizeof(dtype_t)));
+#else
+    *const_cast<dtype_t*>(smem_dst) = *gmem_src;
+#endif
 }
 
 __forceinline__ __device__ void cp_async_mbarrier_arrive(mbarrier* ptr) {
+#ifndef DISABLE_SM90_FEATURES
     asm volatile("cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n" ::
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+#endif
 }
 
 /// Barriers

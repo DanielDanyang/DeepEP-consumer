@@ -66,6 +66,20 @@ public:
             flags += " -DNCCL_DEVICE_GIN_GDAKI_ENABLE_DEBUG=1";
         flags += fmt::format(" -I {}/include", nccl_root.c_str());
 
+        // The JIT kernels include the same DeepEP headers as the ahead-of-time
+        // extension, so architecture feature macros must be forwarded here.
+        // Otherwise an L4/SM89 build compiles the extension with SM90 paths
+        // disabled while runtime NVCC still instantiates Hopper-only JIT code.
+#if defined(DISABLE_SM90_FEATURES)
+        flags += " -DDISABLE_SM90_FEATURES";
+#endif
+#if defined(DISABLE_AGGRESSIVE_PTX_INSTRS)
+        flags += " -DDISABLE_AGGRESSIVE_PTX_INSTRS";
+#endif
+#if defined(DISABLE_LEGACY_INTERNODE)
+        flags += " -DDISABLE_LEGACY_INTERNODE";
+#endif
+
         // Some special flags for EP
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)

@@ -80,10 +80,11 @@ combine_impl(nv_bfloat16* x,
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
     // Do TMA writes into the remote buffers
-    int num_tokens_per_warp = math::ceil_div(num_reduced_tokens, kNumSMs * kNumWarps);
-    const int token_start_idx = num_tokens_per_warp * global_warp_idx;
-    const int token_end_idx = min(token_start_idx + num_tokens_per_warp, num_reduced_tokens);
-    for (int i = token_start_idx; i < token_end_idx; ++ i) {
+    // SM89/L4 does not have Hopper TMA to hide remote-store latency.  Striding
+    // work by global warp keeps each warp exposed to a similar mix of source
+    // ranks and top-k slots instead of letting contiguous metadata regions
+    // concentrate slow PCIe peer writes on a subset of warps.
+    for (int i = global_warp_idx; i < num_reduced_tokens; i += kNumSMs * kNumWarps) {
         // The master slot index during dispatch
         constexpr int kMetadataStride = 2 + kNumTopk;
         const int src_token_idx = __ldg(src_metadata + i * kMetadataStride) % kNumMaxTokensPerRank;
@@ -130,6 +131,7 @@ combine_impl(nv_bfloat16* x,
                 token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
             // No reduce
+#ifndef DISABLE_SM90_FEATURES
             if (ptx::elect_one_sync()) {
                 const auto load_ptr =
                     math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
@@ -140,6 +142,17 @@ combine_impl(nv_bfloat16* x,
                 ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), kNumHiddenBytes);
                 ptx::tma_store_commit();
             }
+#else
+            const auto load_ptr =
+                math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
+            ptx::tma_store_wait();
+            // In the SM89 fallback this helper is a synchronous warp copy, not
+            // a true TMA store.  Avoid shared-memory staging in the no-reduce
+            // path and copy BF16 payloads directly from the combine input into
+            // the master token slot.
+            ptx::tma_store_1d_warp(master_token_buffer.get_base_ptr(), load_ptr, kNumHiddenBytes);
+            ptx::tma_store_commit();
+#endif
             __syncwarp();
         } else if constexpr (kAllowMultipleReduction) {
             // Do local reduction

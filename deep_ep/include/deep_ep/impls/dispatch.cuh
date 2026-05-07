@@ -279,10 +279,15 @@ dispatch_impl(
             __syncwarp();
 
             // Issue data TMA
+#ifndef DISABLE_SM90_FEATURES
             if (ptx::elect_one_sync()) {
                 ptx::tma_load_1d(tma_buffer.get_hidden_ptr(), math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
                                  mbarrier_ptr, kNumHiddenBytes);
             }
+#else
+            ptx::tma_load_1d_warp(tma_buffer.get_hidden_ptr(), math::advance_ptr(x, token_i64_idx * kNumHiddenBytes),
+                                  kNumHiddenBytes);
+#endif
             __syncwarp();
 
             // Issue SF TMA or cp.async
@@ -356,8 +361,12 @@ dispatch_impl(
             // TMA store to send buffer
             auto send_buffer_ptr = send_buffer.get_token_buffer(token_idx).get_base_ptr();
             if constexpr (not kIsScaleupNVLink) {
+#ifndef DISABLE_SM90_FEATURES
                 if (ptx::elect_one_sync())
                     ptx::tma_store_1d(send_buffer_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+#else
+                ptx::tma_store_1d_warp(send_buffer_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+#endif
                 ptx::tma_store_commit();
                 __syncwarp();
             }
@@ -367,8 +376,19 @@ dispatch_impl(
             const auto dst_ptr = stored_dst_slot_idx >= 0 ?
                 gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
                 nullptr;
+#ifndef DISABLE_SM90_FEATURES
             if (dst_ptr != nullptr)
                 ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+#else
+            auto dst_mask = ptx::gather(dst_ptr != nullptr);
+            while (dst_mask) {
+                const int master_lane_idx = __ffs(dst_mask) - 1;
+                ptx::tma_store_1d_warp(
+                    ptx::exchange(dst_ptr, master_lane_idx),
+                    tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                dst_mask &= dst_mask - 1;
+            }
+#endif
             ptx::tma_store_commit();
             __syncwarp();
 
@@ -394,7 +414,9 @@ dispatch_impl(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
     // Trigger the copy epilogue kernel
+#ifndef DISABLE_SM90_FEATURES
     cudaTriggerProgrammaticLaunchCompletion();
+#endif
 
     // Clean atomic counters
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");

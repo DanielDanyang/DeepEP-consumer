@@ -148,6 +148,13 @@ static void* launch_combine(void* x,
     }
 
     // Generate, build and launch
+#if defined(DISABLE_SM90_FEATURES)
+    // SM89 does not support CTA clusters.  Keep launch ordering simple and let
+    // the non-TMA fallback copy path serialize through the stream.
+    constexpr int cluster_dim = 1;
+#else
+    const int cluster_dim = 2 - (num_sms % 2);
+#endif
     const auto num_threads = num_warps * 32;
     const CombineRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
@@ -171,7 +178,7 @@ static void* launch_combine(void* x,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, cluster_dim, true)
     };
     const auto code = CombineRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine", code);
@@ -265,6 +272,11 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     const auto num_threads = num_warps * 32;
 
     // Generate, build and launch
+#if defined(DISABLE_SM90_FEATURES)
+    constexpr bool enable_pdl = false;
+#else
+    constexpr bool enable_pdl = true;
+#endif
     const CombineReduceEpilogueRuntime::Args args = {
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
@@ -279,7 +291,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .bias_0 = bias_0, .bias_1 = bias_1,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, enable_pdl)
     };
     const auto code = CombineReduceEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine_reduce_epilogue", code);
