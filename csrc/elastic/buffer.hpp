@@ -466,9 +466,9 @@ public:
         return {std::move(out), std::move(handle)};
     }
 
-    torch::cuda::CUDAStream stream_control_prologue(const std::optional<EventHandle>& previous_event,
-                                                    const bool& allocate_on_comm_stream,
-                                                    const bool& async_with_compute_stream) const {
+    at::cuda::CUDAStream stream_control_prologue(const std::optional<EventHandle>& previous_event,
+                                                 const bool& allocate_on_comm_stream,
+                                                 const bool& async_with_compute_stream) const {
         // Allocate all tensors on communication stream if set
         // NOTES: do not allocate tensors upfront!
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -1302,6 +1302,9 @@ static void register_apis(pybind11::module_& m) {
     // Communication domain utilities
     m.def("get_physical_domain_size", &nccl::get_physical_domain_size);
     m.def("get_logical_domain_size", &nccl::get_logical_domain_size);
+
+    // Host-staging scale-out building blocks
+    m.def("host_staging_pack_fp8_dispatch", &host_staging_pack_fp8_dispatch);
 }
 
 }  // namespace deep_ep
