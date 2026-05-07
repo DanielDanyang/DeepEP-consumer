@@ -74,23 +74,39 @@ static void __instantiate_kernel() {{
     }
 };
 
-static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-host_staging_pack_fp8_dispatch(const torch::Tensor& x,
-                               const torch::Tensor& sf,
-                               const torch::Tensor& topk_idx,
-                               const std::optional<torch::Tensor>& topk_weights,
-                               const int& rank_idx,
-                               const int& num_ranks,
-                               const int& num_scaleup_ranks,
-                               const int& num_experts,
-                               const int& num_sms) {
+static void host_staging_check_fp8_dispatch_pack_args(const torch::Tensor& x,
+                                                      const torch::Tensor& sf,
+                                                      const torch::Tensor& topk_idx,
+                                                      const std::optional<torch::Tensor>& topk_weights,
+                                                      const torch::Tensor& packed_x,
+                                                      const torch::Tensor& packed_sf,
+                                                      const torch::Tensor& packed_topk_idx,
+                                                      const torch::Tensor& packed_topk_weights,
+                                                      const torch::Tensor& packed_src_token_idx,
+                                                      const torch::Tensor& packed_count,
+                                                      const int& num_ranks,
+                                                      const int& num_scaleup_ranks,
+                                                      const int& num_experts,
+                                                      const int& num_sms) {
     EP_HOST_ASSERT(x.is_cuda() and x.is_contiguous());
     EP_HOST_ASSERT(sf.is_cuda() and sf.is_contiguous());
     EP_HOST_ASSERT(topk_idx.is_cuda() and topk_idx.is_contiguous());
+    EP_HOST_ASSERT(packed_x.is_cuda() and packed_x.is_contiguous());
+    EP_HOST_ASSERT(packed_sf.is_cuda() and packed_sf.is_contiguous());
+    EP_HOST_ASSERT(packed_topk_idx.is_cuda() and packed_topk_idx.is_contiguous());
+    EP_HOST_ASSERT(packed_topk_weights.is_cuda() and packed_topk_weights.is_contiguous());
+    EP_HOST_ASSERT(packed_src_token_idx.is_cuda() and packed_src_token_idx.is_contiguous());
+    EP_HOST_ASSERT(packed_count.is_cuda() and packed_count.is_contiguous());
     EP_HOST_ASSERT(x.dim() == 2 and sf.dim() == 2 and topk_idx.dim() == 2);
     EP_HOST_ASSERT(x.element_size() == 1 and "Host-staging pack currently targets FP8 dispatch payloads");
     EP_HOST_ASSERT(sf.element_size() == sizeof(sf_pack_t));
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+    EP_HOST_ASSERT(packed_x.scalar_type() == x.scalar_type() and packed_x.sizes() == x.sizes());
+    EP_HOST_ASSERT(packed_sf.scalar_type() == sf.scalar_type() and packed_sf.sizes() == sf.sizes());
+    EP_HOST_ASSERT(packed_topk_idx.scalar_type() == topk_idx.scalar_type() and packed_topk_idx.sizes() == topk_idx.sizes());
+    EP_HOST_ASSERT(packed_topk_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(packed_src_token_idx.scalar_type() == torch::kInt32 and packed_src_token_idx.numel() >= x.size(0));
+    EP_HOST_ASSERT(packed_count.scalar_type() == torch::kInt32 and packed_count.numel() == 1);
     EP_HOST_ASSERT(num_ranks > 0 and num_scaleup_ranks > 0 and num_ranks % num_scaleup_ranks == 0);
     EP_HOST_ASSERT(num_experts > 0 and num_experts % (num_ranks / num_scaleup_ranks) == 0);
     EP_HOST_ASSERT(num_sms > 0);
@@ -102,23 +118,41 @@ host_staging_pack_fp8_dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(sf.size(0) == num_tokens and topk_idx.size(0) == num_tokens);
     EP_HOST_ASSERT(hidden_bytes % sizeof(int4) == 0);
 
-    float* topk_weights_ptr = nullptr;
-    torch::Tensor packed_topk_weights;
     if (topk_weights.has_value()) {
         EP_HOST_ASSERT(topk_weights->is_cuda() and topk_weights->is_contiguous());
         EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat32);
         EP_HOST_ASSERT(topk_weights->size(0) == num_tokens and topk_weights->size(1) == num_topk);
-        topk_weights_ptr = topk_weights->data_ptr<float>();
-        packed_topk_weights = torch::empty_like(topk_weights.value());
-    } else {
-        packed_topk_weights = torch::empty({num_tokens, num_topk}, x.options().dtype(torch::kFloat32));
     }
+    EP_HOST_ASSERT(packed_topk_weights.dim() == 2 and
+                   packed_topk_weights.size(0) == num_tokens and packed_topk_weights.size(1) == num_topk);
 
-    auto packed_x = torch::empty_like(x);
-    auto packed_sf = torch::empty_like(sf);
-    auto packed_topk_idx = torch::empty_like(topk_idx);
-    auto packed_src_token_idx = torch::empty({num_tokens}, x.options().dtype(torch::kInt32));
-    auto packed_count = torch::zeros({1}, x.options().dtype(torch::kInt32));
+}
+
+static void host_staging_pack_fp8_dispatch_out(const torch::Tensor& x,
+                                               const torch::Tensor& sf,
+                                               const torch::Tensor& topk_idx,
+                                               const std::optional<torch::Tensor>& topk_weights,
+                                               const torch::Tensor& packed_x,
+                                               const torch::Tensor& packed_sf,
+                                               const torch::Tensor& packed_topk_idx,
+                                               const torch::Tensor& packed_topk_weights,
+                                               const torch::Tensor& packed_src_token_idx,
+                                               const torch::Tensor& packed_count,
+                                               const int& rank_idx,
+                                               const int& num_ranks,
+                                               const int& num_scaleup_ranks,
+                                               const int& num_experts,
+                                               const int& num_sms) {
+    host_staging_check_fp8_dispatch_pack_args(x, sf, topk_idx, topk_weights,
+                                              packed_x, packed_sf, packed_topk_idx, packed_topk_weights,
+                                              packed_src_token_idx, packed_count,
+                                              num_ranks, num_scaleup_ranks, num_experts, num_sms);
+
+    const int num_tokens = static_cast<int>(x.size(0));
+    const int hidden_bytes = static_cast<int>(x.size(1) * x.element_size());
+    const int num_sf_packs = static_cast<int>(sf.size(1));
+    const int num_topk = static_cast<int>(topk_idx.size(1));
+    float* topk_weights_ptr = topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr;
 
     constexpr int num_threads = 256;
     const HostStagingPackRuntime::Args args = {
@@ -143,7 +177,32 @@ host_staging_pack_fp8_dispatch(const torch::Tensor& x,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 1, false)};
     const auto code = HostStagingPackRuntime::generate(args);
     const auto runtime = jit::compiler->build("host_staging_pack_fp8_dispatch", code);
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(packed_count.data_ptr<int>(), 0, sizeof(int), at::cuda::getCurrentCUDAStream()));
     HostStagingPackRuntime::launch(runtime, args, at::cuda::getCurrentCUDAStream());
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+host_staging_pack_fp8_dispatch(const torch::Tensor& x,
+                               const torch::Tensor& sf,
+                               const torch::Tensor& topk_idx,
+                               const std::optional<torch::Tensor>& topk_weights,
+                               const int& rank_idx,
+                               const int& num_ranks,
+                               const int& num_scaleup_ranks,
+                               const int& num_experts,
+                               const int& num_sms) {
+    auto packed_x = torch::empty_like(x);
+    auto packed_sf = torch::empty_like(sf);
+    auto packed_topk_idx = torch::empty_like(topk_idx);
+    auto packed_topk_weights = topk_weights.has_value() ?
+        torch::empty_like(topk_weights.value()) :
+        torch::empty({x.size(0), topk_idx.size(1)}, x.options().dtype(torch::kFloat32));
+    auto packed_src_token_idx = torch::empty({x.size(0)}, x.options().dtype(torch::kInt32));
+    auto packed_count = torch::empty({1}, x.options().dtype(torch::kInt32));
+    host_staging_pack_fp8_dispatch_out(x, sf, topk_idx, topk_weights,
+                                       packed_x, packed_sf, packed_topk_idx, packed_topk_weights,
+                                       packed_src_token_idx, packed_count,
+                                       rank_idx, num_ranks, num_scaleup_ranks, num_experts, num_sms);
     return {packed_x, packed_sf, packed_topk_idx, packed_topk_weights, packed_src_token_idx, packed_count};
 }
 

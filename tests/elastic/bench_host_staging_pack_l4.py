@@ -72,8 +72,23 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
     x_fp8 = x_fp8.contiguous()
     sf = sf.contiguous()
     topk_weights = topk_weights.contiguous()
+    reusable_outputs = (
+        torch.empty_like(x_fp8),
+        torch.empty_like(sf),
+        torch.empty_like(topk_idx),
+        torch.empty_like(topk_weights),
+        torch.empty((args.num_tokens,), dtype=torch.int32, device="cuda"),
+        torch.empty((1,), dtype=torch.int32, device="cuda"),
+    )
 
     def pack():
+        if not args.allocate_each_iter:
+            deep_ep._C.host_staging_pack_fp8_dispatch_out(
+                x_fp8, sf, topk_idx, topk_weights,
+                reusable_outputs[0], reusable_outputs[1], reusable_outputs[2],
+                reusable_outputs[3], reusable_outputs[4], reusable_outputs[5],
+                rank_idx, args.num_ranks, args.num_scaleup_ranks, args.num_experts, args.num_sms)
+            return reusable_outputs
         return deep_ep._C.host_staging_pack_fp8_dispatch(
             x_fp8, sf, topk_idx, topk_weights,
             rank_idx, args.num_ranks, args.num_scaleup_ranks, args.num_experts, args.num_sms)
@@ -136,6 +151,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--unbalanced-ratio", type=float, default=1.0)
     parser.add_argument("--check-payload", action="store_true")
+    parser.add_argument("--allocate-each-iter", action="store_true")
     args = parser.parse_args()
 
     devices = parse_csv_ints(args.devices)

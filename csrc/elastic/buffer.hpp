@@ -1305,6 +1305,7 @@ static void register_apis(pybind11::module_& m) {
 
     // Host-staging scale-out building blocks
     m.def("host_staging_pack_fp8_dispatch", &host_staging_pack_fp8_dispatch);
+    m.def("host_staging_pack_fp8_dispatch_out", &host_staging_pack_fp8_dispatch_out);
 }
 
 }  // namespace deep_ep
