@@ -85,13 +85,21 @@ init_jit()
 
 
 # Import APIs after initialization
-from .buffers.legacy import Buffer
+try:
+    Config = _C.Config
+    from .buffers.legacy import Buffer
+except AttributeError:
+    Config = None
+
+    class Buffer:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError('deep_ep.Buffer is disabled in this Elastic/JIT-only build')
+
 from .buffers.elastic import ElasticBuffer, EPHandle
 # noinspection PyUnresolvedReferences
 from .utils.event import EventOverlap, EventHandle
 from .utils.envs import get_physical_domain_size, get_logical_domain_size
 
-# noinspection PyUnresolvedReferences
-from deep_ep._C import Config, topk_idx_t
+topk_idx_t = _C.topk_idx_t
 
 __version__ = '2.0.0'

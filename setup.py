@@ -26,6 +26,13 @@ def get_nvshmem_host_lib_name(base_dir):
     raise ModuleNotFoundError('libnvshmem_host.so not found')
 
 
+def get_nccl_lib_name(base_dir):
+    path = Path(base_dir).joinpath('lib')
+    for file in path.rglob('libnccl.so*'):
+        return file.name
+    raise ModuleNotFoundError('libnccl.so not found')
+
+
 def get_package_version():
     with open(Path(current_dir) / 'deep_ep' / '__init__.py', 'r') as f:
         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
@@ -70,13 +77,22 @@ class CustomBuildPy(build_py):
 
 if __name__ == '__main__':
     # TODO: make NVSHMEM and legacy optional
-    nvshmem_root_dir = find_pkgs.find_nvshmem_root()
+    disable_sm90_features = int(os.getenv('DISABLE_SM90_FEATURES', 0))
+    # L4/SM89 rebuilds focus on the v2 Elastic/JIT path.  The legacy
+    # internode/low-latency sources are Hopper/NVSHMEM-oriented and still use
+    # SM90-only TMA helpers, so keep them out of this build instead of carrying
+    # local legacy kernel rewrites.
+    disable_legacy_api = int(os.getenv('DISABLE_LEGACY_API', '1' if disable_sm90_features else '0'))
+    disable_nvshmem = int(os.getenv('DISABLE_NVSHMEM', '1' if disable_legacy_api else '0'))
+
+    nvshmem_root_dir = None if disable_nvshmem else find_pkgs.find_nvshmem_root()
     nccl_root_dir = find_pkgs.find_nccl_root()
+    nccl_lib_name = get_nccl_lib_name(nccl_root_dir)
 
     # `128,2417` is used to suppress warnings of `fmt`
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3', '--extended-lambda', '--diag-suppress=128,2417']
-    sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
+    sources = ['csrc/python_api.cpp']
     include_dirs = [f'{current_dir}/deep_ep/include',
                     f'{current_dir}/third-party/fmt/include',
                     '/usr/local/cuda/include/cccl']
@@ -84,32 +100,39 @@ if __name__ == '__main__':
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
 
+    if disable_legacy_api:
+        cxx_flags.append('-DDISABLE_LEGACY_API')
+        nvcc_flags.append('-DDISABLE_LEGACY_API')
+    else:
+        sources.extend(['csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu'])
+
     # NVSHMEM flags
-    sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
-    include_dirs.extend([f'{nvshmem_root_dir}/include'])
-    library_dirs.extend([f'{nvshmem_root_dir}/lib'])
-    nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
-    extra_link_args.extend([f'-l:libnvshmem_host.so', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_root_dir}/lib'])
+    if not disable_nvshmem:
+        sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
+        include_dirs.extend([f'{nvshmem_root_dir}/include'])
+        library_dirs.extend([f'{nvshmem_root_dir}/lib'])
+        nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
+        extra_link_args.extend([f'-l:libnvshmem_host.so', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_root_dir}/lib'])
 
     # NCCL flags
     sources.extend(['csrc/kernels/backend/nccl.cu'])
     include_dirs.extend([f'{nccl_root_dir}/include'])
-    extra_link_args.extend([f'-l:libnccl.so', f'-Wl,-rpath,{nccl_root_dir}/lib'])
+    library_dirs.extend([f'{nccl_root_dir}/lib'])
+    extra_link_args.extend([f'-l:{nccl_lib_name}', f'-Wl,-rpath,{nccl_root_dir}/lib'])
 
     # CUDA driver sources
     sources.extend(['csrc/kernels/backend/cuda_driver.cu'])
 
     # TODO: remove these
-    if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
-        # Prefer A100
-        os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '8.0')
+    if disable_sm90_features:
+        # Prefer the current L4 target when Hopper-only features are disabled.
+        # This keeps the build path focused on SM89 JIT/Elastic work without
+        # touching legacy kernels unless the caller explicitly enables them.
+        os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '8.9')
 
         # Disable some SM90 features: FP8, launch methods, and TMA
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
-
-        # Disable internode and low-latency kernels
-        assert False, 'Not implemented'
     else:
         # Prefer H800 series
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')
@@ -156,6 +179,7 @@ if __name__ == '__main__':
     print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
     print(f' > NVSHMEM path: {nvshmem_root_dir}')
     print(f' > NCCL path: {nccl_root_dir}')
+    print(f' > Legacy API enabled: {not disable_legacy_api}')
     # Print persistent env variables
     persistent_envs = []
     for name in persistent_env_names:

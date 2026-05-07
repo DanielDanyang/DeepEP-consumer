@@ -5,7 +5,10 @@
 
 #include "jit/api.hpp"
 #include "elastic/buffer.hpp"
+#include "utils/event.hpp"
+#ifndef DISABLE_LEGACY_API
 #include "legacy/buffer.hpp"
+#endif
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -32,7 +35,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_ep::jit::register_apis(m);
 
     // Register legacy buffer APIs
+#ifndef DISABLE_LEGACY_API
     deep_ep::legacy::register_apis(m);
+#else
+    // Elastic dispatch/combine still uses EventHandle for stream ownership.
+    // Legacy used to export this binding, so the Elastic-only L4 build must
+    // keep the small event API available without pulling legacy kernels in.
+    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
+        .def(pybind11::init<>())
+        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+#endif
 
     // Register elastic buffer (DeepEP V2) APIs
     deep_ep::elastic::register_apis(m);

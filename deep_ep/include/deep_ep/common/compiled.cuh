@@ -28,16 +28,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#ifndef DISABLE_SM90_FEATURES
 #include <cuda_fp8.h>
-#else
-// Ampere does not support FP8 features
-#define __NV_E4M3 0
-#define __NV_E5M2 1
-typedef int __nv_fp8_interpretation_t;
-typedef int __nv_fp8x4_e4m3;
-typedef uint8_t __nv_fp8_storage_t;
-#endif
 
 // Compatibility: 256 bits LD/ST instructions
 #if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
