@@ -74,6 +74,57 @@ static void __instantiate_kernel() {{
     }
 };
 
+class HostStagingPackBf16CombineRuntime final : public jit::LaunchRuntime<HostStagingPackBf16CombineRuntime> {
+public:
+    struct Args {
+        int hidden_bytes;
+        int num_topk;
+
+        const nv_bfloat16* x;
+        const topk_idx_t* topk_idx;
+        nv_bfloat16* packed_x;
+        int* packed_src_token_idx;
+        int* packed_count;
+        int num_tokens;
+        int rank_idx;
+        int num_ranks;
+        int num_scaleup_ranks;
+        int num_experts;
+
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/host_staging.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&host_staging_pack_bf16_combine_impl<{}, {}, {}>);
+}}
+)",
+                           args.launch_args.num_threads,
+                           args.hidden_bytes,
+                           args.num_topk);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.x,
+            args.topk_idx,
+            args.packed_x,
+            args.packed_src_token_idx,
+            args.packed_count,
+            args.num_tokens,
+            args.rank_idx,
+            args.num_ranks,
+            args.num_scaleup_ranks,
+            args.num_experts));
+    }
+};
+
 static void host_staging_check_fp8_dispatch_pack_args(const torch::Tensor& x,
                                                       const torch::Tensor& sf,
                                                       const torch::Tensor& topk_idx,
@@ -204,6 +255,84 @@ host_staging_pack_fp8_dispatch(const torch::Tensor& x,
                                        packed_src_token_idx, packed_count,
                                        rank_idx, num_ranks, num_scaleup_ranks, num_experts, num_sms);
     return {packed_x, packed_sf, packed_topk_idx, packed_topk_weights, packed_src_token_idx, packed_count};
+}
+
+static void host_staging_check_bf16_combine_pack_args(const torch::Tensor& x,
+                                                      const torch::Tensor& topk_idx,
+                                                      const torch::Tensor& packed_x,
+                                                      const torch::Tensor& packed_src_token_idx,
+                                                      const torch::Tensor& packed_count,
+                                                      const int& num_ranks,
+                                                      const int& num_scaleup_ranks,
+                                                      const int& num_experts,
+                                                      const int& num_sms) {
+    EP_HOST_ASSERT(x.is_cuda() and x.is_contiguous());
+    EP_HOST_ASSERT(topk_idx.is_cuda() and topk_idx.is_contiguous());
+    EP_HOST_ASSERT(packed_x.is_cuda() and packed_x.is_contiguous());
+    EP_HOST_ASSERT(packed_src_token_idx.is_cuda() and packed_src_token_idx.is_contiguous());
+    EP_HOST_ASSERT(packed_count.is_cuda() and packed_count.is_contiguous());
+    EP_HOST_ASSERT(x.dim() == 2 and topk_idx.dim() == 2);
+    EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+    EP_HOST_ASSERT(packed_x.scalar_type() == x.scalar_type() and packed_x.sizes() == x.sizes());
+    EP_HOST_ASSERT(packed_src_token_idx.scalar_type() == torch::kInt32 and packed_src_token_idx.numel() >= x.size(0));
+    EP_HOST_ASSERT(packed_count.scalar_type() == torch::kInt32 and packed_count.numel() == 1);
+    EP_HOST_ASSERT(topk_idx.size(0) == x.size(0));
+    EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
+    EP_HOST_ASSERT(num_ranks > 0 and num_scaleup_ranks > 0 and num_ranks % num_scaleup_ranks == 0);
+    EP_HOST_ASSERT(num_experts > 0 and num_experts % (num_ranks / num_scaleup_ranks) == 0);
+    EP_HOST_ASSERT(num_sms > 0);
+}
+
+static void host_staging_pack_bf16_combine_out(const torch::Tensor& x,
+                                               const torch::Tensor& topk_idx,
+                                               const torch::Tensor& packed_x,
+                                               const torch::Tensor& packed_src_token_idx,
+                                               const torch::Tensor& packed_count,
+                                               const int& rank_idx,
+                                               const int& num_ranks,
+                                               const int& num_scaleup_ranks,
+                                               const int& num_experts,
+                                               const int& num_sms) {
+    host_staging_check_bf16_combine_pack_args(
+        x, topk_idx, packed_x, packed_src_token_idx, packed_count,
+        num_ranks, num_scaleup_ranks, num_experts, num_sms);
+
+    constexpr int num_threads = 256;
+    const HostStagingPackBf16CombineRuntime::Args args = {
+        .hidden_bytes = static_cast<int>(x.size(1) * x.element_size()),
+        .num_topk = static_cast<int>(topk_idx.size(1)),
+        .x = reinterpret_cast<nv_bfloat16*>(x.data_ptr()),
+        .topk_idx = topk_idx.data_ptr<topk_idx_t>(),
+        .packed_x = reinterpret_cast<nv_bfloat16*>(packed_x.data_ptr()),
+        .packed_src_token_idx = packed_src_token_idx.data_ptr<int>(),
+        .packed_count = packed_count.data_ptr<int>(),
+        .num_tokens = static_cast<int>(x.size(0)),
+        .rank_idx = rank_idx,
+        .num_ranks = num_ranks,
+        .num_scaleup_ranks = num_scaleup_ranks,
+        .num_experts = num_experts,
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 1, false)};
+    const auto code = HostStagingPackBf16CombineRuntime::generate(args);
+    const auto runtime = jit::compiler->build("host_staging_pack_bf16_combine", code);
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(packed_count.data_ptr<int>(), 0, sizeof(int), at::cuda::getCurrentCUDAStream()));
+    HostStagingPackBf16CombineRuntime::launch(runtime, args, at::cuda::getCurrentCUDAStream());
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+host_staging_pack_bf16_combine(const torch::Tensor& x,
+                               const torch::Tensor& topk_idx,
+                               const int& rank_idx,
+                               const int& num_ranks,
+                               const int& num_scaleup_ranks,
+                               const int& num_experts,
+                               const int& num_sms) {
+    auto packed_x = torch::empty_like(x);
+    auto packed_src_token_idx = torch::empty({x.size(0)}, x.options().dtype(torch::kInt32));
+    auto packed_count = torch::empty({1}, x.options().dtype(torch::kInt32));
+    host_staging_pack_bf16_combine_out(x, topk_idx, packed_x, packed_src_token_idx, packed_count,
+                                       rank_idx, num_ranks, num_scaleup_ranks, num_experts, num_sms);
+    return {packed_x, packed_src_token_idx, packed_count};
 }
 
 }  // namespace deep_ep::elastic

@@ -107,6 +107,7 @@ def connect_with_retry(host: str, port: int, timeout_s: float) -> socket.socket:
         try:
             sock = socket.create_connection((host, port), timeout=5.0)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(None)
             return sock
         except OSError as exc:
             last_error = exc
@@ -126,6 +127,16 @@ def make_packed_byte_views(outputs: Tuple[torch.Tensor, ...],
         byte_view(packed_sf, actual_count * num_sf_packs * packed_sf.element_size()),
         byte_view(packed_topk_idx, actual_count * num_topk * topk_idx_elem_size),
         byte_view(packed_topk_weights, actual_count * num_topk * packed_topk_weights.element_size()),
+        byte_view(packed_src_token_idx, actual_count * packed_src_token_idx.element_size()),
+    ]
+
+
+def make_bf16_combine_byte_views(outputs: Tuple[torch.Tensor, ...],
+                                 actual_count: int,
+                                 hidden: int) -> List[torch.Tensor]:
+    packed_x, packed_src_token_idx, _ = outputs
+    return [
+        byte_view(packed_x, actual_count * hidden * packed_x.element_size()),
         byte_view(packed_src_token_idx, actual_count * packed_src_token_idx.element_size()),
     ]
 
@@ -160,23 +171,45 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
     # This smoke measures the explicit host-staging payload path, so avoid pulling
     # torch.compile FP8 casting into the critical path. Any byte is a valid E4M3
     # storage value for copy/transport validation.
-    x_fp8 = torch.randint(
-        0, 256, (args.num_tokens, args.hidden), dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
-    sf = torch.rand((args.num_tokens, (args.hidden + 127) // 128), dtype=torch.float32, device="cuda")
-    outputs = (
-        torch.empty_like(x_fp8),
-        torch.empty_like(sf),
-        torch.empty_like(topk_idx),
-        torch.empty_like(topk_weights),
-        torch.empty((args.num_tokens,), dtype=torch.int32, device="cuda"),
-        torch.empty((1,), dtype=torch.int32, device="cuda"),
-    )
+    if args.payload_mode == "dispatch_fp8":
+        x_fp8 = torch.randint(
+            0, 256, (args.num_tokens, args.hidden), dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+        sf = torch.rand((args.num_tokens, (args.hidden + 127) // 128), dtype=torch.float32, device="cuda")
+        outputs = (
+            torch.empty_like(x_fp8),
+            torch.empty_like(sf),
+            torch.empty_like(topk_idx),
+            torch.empty_like(topk_weights),
+            torch.empty((args.num_tokens,), dtype=torch.int32, device="cuda"),
+            torch.empty((1,), dtype=torch.int32, device="cuda"),
+        )
 
-    def pack_once() -> None:
-        deep_ep._C.host_staging_pack_fp8_dispatch_out(
-            x_fp8, sf, topk_idx, topk_weights,
-            outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5],
-            rank_idx, args.num_ranks, args.num_scaleup_ranks, args.num_experts, args.num_sms)
+        def pack_once() -> None:
+            deep_ep._C.host_staging_pack_fp8_dispatch_out(
+                x_fp8, sf, topk_idx, topk_weights,
+                outputs[0], outputs[1], outputs[2], outputs[3], outputs[4], outputs[5],
+                rank_idx, args.num_ranks, args.num_scaleup_ranks, args.num_experts, args.num_sms)
+
+        def packed_byte_views(actual_count: int) -> List[torch.Tensor]:
+            return make_packed_byte_views(
+                outputs, actual_count, args.hidden, sf.size(1), args.num_topk, topk_idx.element_size())
+    elif args.payload_mode == "combine_bf16":
+        x_bf16 = torch.randn((args.num_tokens, args.hidden), dtype=torch.bfloat16, device="cuda")
+        outputs = (
+            torch.empty_like(x_bf16),
+            torch.empty((args.num_tokens,), dtype=torch.int32, device="cuda"),
+            torch.empty((1,), dtype=torch.int32, device="cuda"),
+        )
+
+        def pack_once() -> None:
+            deep_ep._C.host_staging_pack_bf16_combine_out(
+                x_bf16, topk_idx, outputs[0], outputs[1], outputs[2],
+                rank_idx, args.num_ranks, args.num_scaleup_ranks, args.num_experts, args.num_sms)
+
+        def packed_byte_views(actual_count: int) -> List[torch.Tensor]:
+            return make_bf16_combine_byte_views(outputs, actual_count, args.hidden)
+    else:
+        raise ValueError(f"Unsupported payload mode: {args.payload_mode}")
 
     for _ in range(args.warmups):
         pack_once()
@@ -186,9 +219,8 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
     torch.cuda.synchronize()
     pack_s = time.perf_counter() - pack_start
 
-    actual_count = int(outputs[5].cpu().item())
-    packed_views = make_packed_byte_views(
-        outputs, actual_count, args.hidden, sf.size(1), args.num_topk, topk_idx.element_size())
+    actual_count = int(outputs[-1].cpu().item())
+    packed_views = packed_byte_views(actual_count)
     host_send = [
         torch.empty((view.numel(),), dtype=torch.uint8, pin_memory=True, device="cpu")
         for view in packed_views
@@ -310,6 +342,7 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
         "rank_idx": rank_idx,
         "device": device,
         "peer_rank_idx": peer_rank_idx,
+        "payload_mode": args.payload_mode,
         "send_remote_tokens": actual_count,
         "recv_remote_tokens": int(recv_header["remote_tokens"]),
         "send_bytes": send_bytes,
@@ -335,6 +368,10 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
         "rdma_sequential_est_us": rdma_sequential_s * 1e6,
         "ep_rdma_budget_est_us": rdma_est_ep_s * 1e6,
         "copy_streams": args.copy_streams,
+        "num_sms": args.num_sms,
+        "hidden": args.hidden,
+        "num_topk": args.num_topk,
+        "num_experts": args.num_experts,
     }
     # Preserve the original single-sample field names for quick grepping.
     row.update({
@@ -362,6 +399,7 @@ def main() -> None:
     parser.add_argument("--num-experts", type=int, default=64)
     parser.add_argument("--num-sms", type=int, default=10)
     parser.add_argument("--copy-streams", type=int, default=2)
+    parser.add_argument("--payload-mode", type=str, default="dispatch_fp8", choices=["dispatch_fp8", "combine_bf16"])
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--socket-warmups", type=int, default=1)
     parser.add_argument("--iters", type=int, default=5)
