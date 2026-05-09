@@ -1,7 +1,9 @@
 import argparse
 import hashlib
 import json
+import math
 import socket
+import statistics
 import struct
 import time
 from typing import Dict, List, Sequence, Tuple
@@ -14,6 +16,11 @@ import deep_ep
 
 def parse_csv_ints(value: str) -> List[int]:
     return [int(item) for item in value.split(",") if item.strip()]
+
+
+def percentile(values: List[float], q: float) -> float:
+    values = sorted(values)
+    return values[max(0, min(len(values) - 1, math.ceil(q * len(values)) - 1))]
 
 
 def byte_view(tensor: torch.Tensor, num_bytes: int) -> torch.Tensor:
@@ -65,6 +72,32 @@ def send_tensors(sock: socket.socket, tensors: Sequence[torch.Tensor]) -> None:
         if tensor.numel() == 0:
             continue
         sock.sendall(memoryview(tensor.numpy()))
+
+
+def exchange_tensors(sock: socket.socket,
+                     node_rank: int,
+                     host_send: Sequence[torch.Tensor],
+                     host_recv: Sequence[torch.Tensor]) -> None:
+    # Keep the transfer order deterministic to avoid deadlock with blocking
+    # Python sockets. This is only a bring-up transport; the performance path
+    # should replace it with persistent ibverbs QPs and full-duplex posting.
+    if node_rank == 0:
+        for tensor in host_recv:
+            recv_tensor(sock, tensor)
+        send_tensors(sock, host_send)
+    else:
+        send_tensors(sock, host_send)
+        for tensor in host_recv:
+            recv_tensor(sock, tensor)
+
+
+def summarize_us(values_s: List[float]) -> Dict[str, float]:
+    return {
+        "median_us": statistics.median(values_s) * 1e6,
+        "p90_us": percentile(values_s, 0.9) * 1e6,
+        "min_us": min(values_s) * 1e6,
+        "max_us": max(values_s) * 1e6,
+    }
 
 
 def connect_with_retry(host: str, port: int, timeout_s: float) -> socket.socket:
@@ -175,7 +208,6 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
         "peer_rank_idx": peer_rank_idx,
         "remote_tokens": actual_count,
         "lengths": lengths,
-        "digests": [tensor_digest(t) for t in host_send],
     }
     port = args.base_port + local_rank
 
@@ -193,36 +225,65 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
             torch.empty((int(size),), dtype=torch.uint8, pin_memory=True, device="cpu")
             for size in recv_header["lengths"]
         ]
-        for tensor in host_recv:
-            recv_tensor(sock, tensor)
         send_json(sock, send_header)
-        send_tensors(sock, host_send)
     else:
         sock = connect_with_retry(args.peer_host, port, args.connect_timeout)
-        transfer_start = time.perf_counter()
         send_json(sock, send_header)
-        send_tensors(sock, host_send)
         recv_header = recv_json(sock)
         host_recv = [
             torch.empty((int(size),), dtype=torch.uint8, pin_memory=True, device="cpu")
             for size in recv_header["lengths"]
         ]
-        for tensor in host_recv:
-            recv_tensor(sock, tensor)
-    sock.close()
-    transfer_s = time.perf_counter() - transfer_start
 
-    expected_digests = recv_header["digests"]
+    send_bytes = sum(lengths)
+    recv_bytes = sum(int(size) for size in recv_header["lengths"])
+    gpu_recv = [torch.empty_like(t, device="cuda") for t in host_recv]
+
+    def timed_iteration() -> Dict[str, float]:
+        torch.cuda.synchronize()
+        pack_start = time.perf_counter()
+        pack_once()
+        torch.cuda.synchronize()
+        pack_s = time.perf_counter() - pack_start
+
+        d2h_start = time.perf_counter()
+        copy_many(packed_views, host_send, copy_streams)
+        torch.cuda.synchronize()
+        d2h_s = time.perf_counter() - d2h_start
+
+        transfer_start = time.perf_counter()
+        exchange_tensors(sock, args.node_rank, host_send, host_recv)
+        transfer_s = time.perf_counter() - transfer_start
+
+        h2d_start = time.perf_counter()
+        copy_many(host_recv, gpu_recv, copy_streams)
+        torch.cuda.synchronize()
+        h2d_s = time.perf_counter() - h2d_start
+        return {
+            "pack_s": pack_s,
+            "d2h_s": d2h_s,
+            "transfer_s": transfer_s,
+            "h2d_s": h2d_s,
+            "ep_s": pack_s + d2h_s + transfer_s + h2d_s,
+        }
+
+    for _ in range(args.socket_warmups):
+        timed_iteration()
+    samples = [timed_iteration() for _ in range(args.iters)]
+
+    final_digest = {"digests": [tensor_digest(t) for t in host_send]}
+    if args.node_rank == 0:
+        recv_digest = recv_json(sock)
+        send_json(sock, final_digest)
+    else:
+        send_json(sock, final_digest)
+        recv_digest = recv_json(sock)
+    sock.close()
+
+    expected_digests = recv_digest["digests"]
     actual_digests = [tensor_digest(t) for t in host_recv]
     if actual_digests != expected_digests:
         raise RuntimeError(f"Digest mismatch on rank {rank_idx}: {actual_digests=} {expected_digests=}")
-
-    gpu_recv = [torch.empty_like(t, device="cuda") for t in host_recv]
-    torch.cuda.synchronize()
-    h2d_start = time.perf_counter()
-    copy_many(host_recv, gpu_recv, copy_streams)
-    torch.cuda.synchronize()
-    h2d_s = time.perf_counter() - h2d_start
 
     if args.check_h2d:
         for host_tensor, gpu_tensor in zip(host_recv, gpu_recv):
@@ -231,9 +292,20 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
             if not torch.equal(gpu_tensor.cpu(), host_tensor):
                 raise RuntimeError(f"H2D mismatch on rank {rank_idx}")
 
-    send_bytes = sum(lengths)
-    recv_bytes = sum(int(size) for size in recv_header["lengths"])
-    queue.put({
+    pack_stats = summarize_us([sample["pack_s"] for sample in samples])
+    d2h_stats = summarize_us([sample["d2h_s"] for sample in samples])
+    transfer_stats = summarize_us([sample["transfer_s"] for sample in samples])
+    h2d_stats = summarize_us([sample["h2d_s"] for sample in samples])
+    ep_stats = summarize_us([sample["ep_s"] for sample in samples])
+    rdma_full_duplex_s = max(send_bytes, recv_bytes) / 1e9 / args.rdma_gbs_per_rank
+    rdma_sequential_s = (send_bytes + recv_bytes) / 1e9 / args.rdma_gbs_per_rank
+    rdma_est_ep_s = (
+        statistics.median([sample["pack_s"] for sample in samples]) +
+        statistics.median([sample["d2h_s"] for sample in samples]) +
+        rdma_full_duplex_s +
+        statistics.median([sample["h2d_s"] for sample in samples])
+    )
+    row = {
         "node_rank": args.node_rank,
         "rank_idx": rank_idx,
         "device": device,
@@ -242,15 +314,36 @@ def worker(local_rank: int, devices: List[int], args: argparse.Namespace, queue:
         "recv_remote_tokens": int(recv_header["remote_tokens"]),
         "send_bytes": send_bytes,
         "recv_bytes": recv_bytes,
-        "pack_us": pack_s * 1e6,
-        "d2h_us": d2h_s * 1e6,
-        "transfer_us": transfer_s * 1e6,
-        "h2d_us": h2d_s * 1e6,
-        "d2h_gbs": send_bytes / 1e9 / d2h_s if d2h_s > 0 else 0,
-        "transfer_gbs": (send_bytes + recv_bytes) / 1e9 / transfer_s if transfer_s > 0 else 0,
-        "h2d_gbs": recv_bytes / 1e9 / h2d_s if h2d_s > 0 else 0,
+        "iters": args.iters,
+        "pack_median_us": pack_stats["median_us"],
+        "pack_p90_us": pack_stats["p90_us"],
+        "d2h_median_us": d2h_stats["median_us"],
+        "d2h_p90_us": d2h_stats["p90_us"],
+        "socket_transfer_median_us": transfer_stats["median_us"],
+        "socket_transfer_p90_us": transfer_stats["p90_us"],
+        "h2d_median_us": h2d_stats["median_us"],
+        "h2d_p90_us": h2d_stats["p90_us"],
+        "ep_socket_median_us": ep_stats["median_us"],
+        "ep_socket_p90_us": ep_stats["p90_us"],
+        "d2h_gbs": send_bytes / 1e9 / statistics.median([sample["d2h_s"] for sample in samples]),
+        "socket_transfer_gbs": (
+            (send_bytes + recv_bytes) / 1e9 / statistics.median([sample["transfer_s"] for sample in samples])
+        ),
+        "h2d_gbs": recv_bytes / 1e9 / statistics.median([sample["h2d_s"] for sample in samples]),
+        "rdma_gbs_per_rank": args.rdma_gbs_per_rank,
+        "rdma_full_duplex_est_us": rdma_full_duplex_s * 1e6,
+        "rdma_sequential_est_us": rdma_sequential_s * 1e6,
+        "ep_rdma_budget_est_us": rdma_est_ep_s * 1e6,
         "copy_streams": args.copy_streams,
+    }
+    # Preserve the original single-sample field names for quick grepping.
+    row.update({
+        "pack_us": row["pack_median_us"],
+        "d2h_us": row["d2h_median_us"],
+        "transfer_us": row["socket_transfer_median_us"],
+        "h2d_us": row["h2d_median_us"],
     })
+    queue.put(row)
 
 
 def main() -> None:
@@ -270,6 +363,9 @@ def main() -> None:
     parser.add_argument("--num-sms", type=int, default=10)
     parser.add_argument("--copy-streams", type=int, default=2)
     parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--socket-warmups", type=int, default=1)
+    parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--rdma-gbs-per-rank", type=float, default=24.75)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check-h2d", action="store_true")
     args = parser.parse_args()
