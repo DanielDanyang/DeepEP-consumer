@@ -105,11 +105,13 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         bytes_per_peer = args.num_tokens * token_bytes
         packed = torch.empty((num_ranks * bytes_per_peer,), dtype=torch.uint8, device="cuda")
         packed_count = torch.empty((num_ranks,), dtype=torch.int32, device="cuda")
+        packed_expert_count = torch.empty((args.num_experts,), dtype=torch.int32, device="cuda")
+        dst_buffer_slot_idx = torch.empty_like(topk_idx, dtype=torch.int32)
 
         def pack_once() -> None:
             deep_ep._C.l4_grouped_pack_fp8_dispatch_out(
                 x_fp8, sf, topk_idx, topk_weights,
-                packed, packed_count,
+                packed, packed_count, packed_expert_count, dst_buffer_slot_idx, args.num_tokens,
                 rank, num_ranks, args.num_experts, args.num_sms)
 
         pack_once()
@@ -164,7 +166,8 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         unpacked_sf = torch.empty((num_recv_tokens, (args.hidden + 127) // 128), dtype=torch.float32, device="cuda")
         unpacked_topk_idx = torch.empty((num_recv_tokens, args.num_topk), dtype=topk_idx.dtype, device="cuda")
         unpacked_topk_weights = torch.empty((num_recv_tokens, args.num_topk), dtype=torch.float32, device="cuda")
-        unpacked_src_token_idx = torch.empty((num_recv_tokens,), dtype=torch.int32, device="cuda")
+        unpacked_src_metadata = torch.empty((num_recv_tokens, args.num_topk + 2), dtype=torch.int32, device="cuda")
+        unpacked_expert_count = torch.empty((args.num_experts // num_ranks,), dtype=torch.int32, device="cuda")
 
         def unpack_once(recv_buffer: torch.Tensor) -> None:
             deep_ep._C.l4_grouped_unpack_fp8_dispatch_out(
@@ -174,8 +177,11 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                 unpacked_sf,
                 unpacked_topk_idx,
                 unpacked_topk_weights,
-                unpacked_src_token_idx,
+                unpacked_src_metadata,
+                unpacked_expert_count,
                 args.num_tokens,
+                rank,
+                args.num_experts,
                 args.num_sms)
 
         def pack_p2p_unpack_once() -> torch.Tensor:

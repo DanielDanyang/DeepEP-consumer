@@ -20,7 +20,10 @@ __global__ void l4_grouped_pack_fp8_dispatch_impl(
     const float* topk_weights,
     uint8_t* packed,
     int* packed_count,
+    int* packed_expert_count,
+    int* dst_buffer_slot_idx,
     const int num_tokens,
+    const int num_max_tokens_per_rank,
     const int rank_idx,
     const int num_experts) {
     constexpr int kNumWarps = kNumThreads / 32;
@@ -45,11 +48,13 @@ __global__ void l4_grouped_pack_fp8_dispatch_impl(
     for (int token_idx = global_warp_idx; token_idx < num_tokens; token_idx += num_global_warps) {
         unsigned dst_rank_mask = 0;
         int stored_expert_idx = -1;
+        int stored_dst_rank_idx = -1;
         if (lane_idx < kNumTopk) {
             stored_expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * kNumTopk + lane_idx));
-            const int dst_rank_idx = stored_expert_idx >= 0 ? stored_expert_idx / num_experts_per_rank : -1;
-            if (dst_rank_idx >= 0)
-                dst_rank_mask = 1u << dst_rank_idx;
+            stored_dst_rank_idx = stored_expert_idx >= 0 ? stored_expert_idx / num_experts_per_rank : -1;
+            if (stored_dst_rank_idx >= 0)
+                dst_rank_mask = 1u << stored_dst_rank_idx;
+            dst_buffer_slot_idx[token_idx * kNumTopk + lane_idx] = -1;
         }
         dst_rank_mask = ptx::reduce_or(dst_rank_mask);
 
@@ -60,7 +65,7 @@ __global__ void l4_grouped_pack_fp8_dispatch_impl(
                 packed_idx = atomicAdd(packed_count + dst_rank_idx, 1);
             packed_idx = ptx::exchange(packed_idx, 0);
 
-            auto token_base = packed + (static_cast<int64_t>(dst_rank_idx) * num_tokens + packed_idx) * kTokenBytes;
+            auto token_base = packed + (static_cast<int64_t>(dst_rank_idx) * num_max_tokens_per_rank + packed_idx) * kTokenBytes;
 
             const auto src_x = reinterpret_cast<const int4*>(
                 static_cast<const uint8_t*>(x) + static_cast<int64_t>(token_idx) * kHiddenBytes);
@@ -82,9 +87,15 @@ __global__ void l4_grouped_pack_fp8_dispatch_impl(
                 metadata[lane_idx] = stored_expert_idx;
                 packed_weights[lane_idx] = topk_weights == nullptr ?
                     0.0f : __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
+                if (stored_dst_rank_idx == dst_rank_idx)
+                    dst_buffer_slot_idx[token_idx * kNumTopk + lane_idx] =
+                        rank_idx * num_max_tokens_per_rank + packed_idx;
+                if (stored_dst_rank_idx == dst_rank_idx)
+                    atomicAdd(packed_expert_count + dst_rank_idx * num_experts_per_rank +
+                              (stored_expert_idx - dst_rank_idx * num_experts_per_rank), 1);
             }
             if (lane_idx == 0)
-                metadata[2 * kNumTopk] = rank_idx * num_tokens + token_idx;
+                metadata[2 * kNumTopk] = rank_idx * num_max_tokens_per_rank + token_idx;
 
             dst_rank_mask &= dst_rank_mask - 1;
         }
@@ -104,9 +115,12 @@ __global__ void l4_grouped_unpack_fp8_dispatch_impl(
     sf_pack_t* recv_sf,
     topk_idx_t* recv_topk_idx,
     float* recv_topk_weights,
-    int* recv_src_token_idx,
+    int* recv_src_metadata,
+    int* recv_expert_count,
     const int num_recv_tokens,
-    const int num_tokens_per_rank) {
+    const int num_tokens_per_rank,
+    const int rank_idx,
+    const int num_experts) {
     constexpr int kNumWarps = kNumThreads / 32;
     constexpr int kHiddenOffset = 0;
     constexpr int kSFOffset = math::constexpr_align(kHiddenBytes, ptx::kNumTMAAlignBytes);
@@ -123,6 +137,10 @@ __global__ void l4_grouped_unpack_fp8_dispatch_impl(
     const int lane_idx = ptx::get_lane_idx();
     const int global_warp_idx = static_cast<int>(blockIdx.x) * kNumWarps + warp_idx;
     const int num_global_warps = static_cast<int>(gridDim.x) * kNumWarps;
+    constexpr int kMetadataStride = kNumTopk + 2;
+    const int num_experts_per_rank = num_experts / kNumRanks;
+    const int expert_start_idx = rank_idx * num_experts_per_rank;
+    const int expert_end_idx = expert_start_idx + num_experts_per_rank;
 
     for (int out_idx = global_warp_idx; out_idx < num_recv_tokens; out_idx += num_global_warps) {
         int src_rank_idx = 0;
@@ -152,12 +170,21 @@ __global__ void l4_grouped_unpack_fp8_dispatch_impl(
 
         const auto metadata = reinterpret_cast<const int*>(token_base + kMetadataOffset);
         const auto packed_weights = reinterpret_cast<const float*>(metadata + kNumTopk);
+        int stored_expert_idx = -1;
+        bool in_range = false;
         if (lane_idx < kNumTopk) {
-            recv_topk_idx[out_idx * kNumTopk + lane_idx] = static_cast<topk_idx_t>(__ldg(metadata + lane_idx));
+            stored_expert_idx = __ldg(metadata + lane_idx);
+            in_range = expert_start_idx <= stored_expert_idx and stored_expert_idx < expert_end_idx;
+            recv_topk_idx[out_idx * kNumTopk + lane_idx] = static_cast<topk_idx_t>(
+                in_range ? stored_expert_idx - expert_start_idx : -1);
             recv_topk_weights[out_idx * kNumTopk + lane_idx] = __ldg(packed_weights + lane_idx);
+            recv_src_metadata[out_idx * kMetadataStride + 2 + lane_idx] = -1;
         }
-        if (lane_idx == 0)
-            recv_src_token_idx[out_idx] = __ldg(metadata + 2 * kNumTopk);
+        const int master_src_topk_idx = ptx::get_master_lane_idx(ptx::gather(in_range));
+        if (lane_idx == 0) {
+            recv_src_metadata[out_idx * kMetadataStride + 0] = __ldg(metadata + 2 * kNumTopk);
+            recv_src_metadata[out_idx * kMetadataStride + 1] = src_rank_idx * kNumTopk + master_src_topk_idx;
+        }
     }
 }
 

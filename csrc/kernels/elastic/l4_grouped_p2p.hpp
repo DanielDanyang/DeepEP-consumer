@@ -36,7 +36,10 @@ public:
         const float* topk_weights;
         uint8_t* packed;
         int* packed_count;
+        int* packed_expert_count;
+        int* dst_buffer_slot_idx;
         int num_tokens;
+        int num_max_tokens_per_rank;
         int rank_idx;
         int num_experts;
 
@@ -70,7 +73,10 @@ static void __instantiate_kernel() {{
             args.topk_weights,
             args.packed,
             args.packed_count,
+            args.packed_expert_count,
+            args.dst_buffer_slot_idx,
             args.num_tokens,
+            args.num_max_tokens_per_rank,
             args.rank_idx,
             args.num_experts));
     }
@@ -91,9 +97,12 @@ public:
         sf_pack_t* recv_sf;
         topk_idx_t* recv_topk_idx;
         float* recv_topk_weights;
-        int* recv_src_token_idx;
+        int* recv_src_metadata;
+        int* recv_expert_count;
         int num_recv_tokens;
         int num_tokens_per_rank;
+        int rank_idx;
+        int num_experts;
 
         jit::LaunchArgs launch_args;
     };
@@ -125,9 +134,12 @@ static void __instantiate_kernel() {{
             args.recv_sf,
             args.recv_topk_idx,
             args.recv_topk_weights,
-            args.recv_src_token_idx,
+            args.recv_src_metadata,
+            args.recv_expert_count,
             args.num_recv_tokens,
-            args.num_tokens_per_rank));
+            args.num_tokens_per_rank,
+            args.rank_idx,
+            args.num_experts));
     }
 };
 
@@ -137,6 +149,8 @@ static void l4_grouped_check_fp8_dispatch_pack_args(const torch::Tensor& x,
                                                     const std::optional<torch::Tensor>& topk_weights,
                                                     const torch::Tensor& packed,
                                                     const torch::Tensor& packed_count,
+                                                    const torch::Tensor& packed_expert_count,
+                                                    const torch::Tensor& dst_buffer_slot_idx,
                                                     const int& rank_idx,
                                                     const int& num_ranks,
                                                     const int& num_experts,
@@ -146,12 +160,16 @@ static void l4_grouped_check_fp8_dispatch_pack_args(const torch::Tensor& x,
     EP_HOST_ASSERT(topk_idx.is_cuda() and topk_idx.is_contiguous());
     EP_HOST_ASSERT(packed.is_cuda() and packed.is_contiguous());
     EP_HOST_ASSERT(packed_count.is_cuda() and packed_count.is_contiguous());
+    EP_HOST_ASSERT(packed_expert_count.is_cuda() and packed_expert_count.is_contiguous());
+    EP_HOST_ASSERT(dst_buffer_slot_idx.is_cuda() and dst_buffer_slot_idx.is_contiguous());
     EP_HOST_ASSERT(x.dim() == 2 and sf.dim() == 2 and topk_idx.dim() == 2);
     EP_HOST_ASSERT(x.element_size() == 1 and "L4 grouped dispatch pack currently targets FP8 payloads");
     EP_HOST_ASSERT(sf.element_size() == sizeof(sf_pack_t));
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
     EP_HOST_ASSERT(packed.scalar_type() == torch::kByte);
     EP_HOST_ASSERT(packed_count.scalar_type() == torch::kInt32 and packed_count.numel() == num_ranks);
+    EP_HOST_ASSERT(packed_expert_count.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(dst_buffer_slot_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(rank_idx >= 0 and rank_idx < num_ranks);
     EP_HOST_ASSERT(num_ranks > 0 and num_ranks <= 32);
     EP_HOST_ASSERT(num_experts > 0 and num_experts % num_ranks == 0);
@@ -163,6 +181,8 @@ static void l4_grouped_check_fp8_dispatch_pack_args(const torch::Tensor& x,
     const int num_topk = static_cast<int>(topk_idx.size(1));
     const int token_bytes = l4_grouped_fp8_dispatch_token_bytes_impl(hidden_bytes, num_sf_packs, num_topk);
     EP_HOST_ASSERT(sf.size(0) == num_tokens and topk_idx.size(0) == num_tokens);
+    EP_HOST_ASSERT(packed_expert_count.numel() == num_experts);
+    EP_HOST_ASSERT(dst_buffer_slot_idx.sizes() == topk_idx.sizes());
     EP_HOST_ASSERT(hidden_bytes % sizeof(int4) == 0);
     EP_HOST_ASSERT(packed.numel() >= static_cast<int64_t>(num_ranks) * num_tokens * token_bytes);
 
@@ -185,19 +205,24 @@ static void l4_grouped_pack_fp8_dispatch_out(const torch::Tensor& x,
                                              const std::optional<torch::Tensor>& topk_weights,
                                              const torch::Tensor& packed,
                                              const torch::Tensor& packed_count,
+                                             const torch::Tensor& packed_expert_count,
+                                             const torch::Tensor& dst_buffer_slot_idx,
+                                             const int& num_max_tokens_per_rank,
                                              const int& rank_idx,
                                              const int& num_ranks,
                                              const int& num_experts,
                                              const int& num_sms) {
     l4_grouped_check_fp8_dispatch_pack_args(
-        x, sf, topk_idx, topk_weights, packed, packed_count,
+        x, sf, topk_idx, topk_weights, packed, packed_count, packed_expert_count, dst_buffer_slot_idx,
         rank_idx, num_ranks, num_experts, num_sms);
+    EP_HOST_ASSERT(num_max_tokens_per_rank >= x.size(0));
 
     constexpr int num_threads = 256;
     const int hidden_bytes = static_cast<int>(x.size(1) * x.element_size());
     const int num_sf_packs = static_cast<int>(sf.size(1));
     const int num_topk = static_cast<int>(topk_idx.size(1));
     const int token_bytes = l4_grouped_fp8_dispatch_token_bytes_impl(hidden_bytes, num_sf_packs, num_topk);
+    EP_HOST_ASSERT(packed.numel() >= static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * token_bytes);
     const float* topk_weights_ptr = topk_weights.has_value() ? topk_weights->data_ptr<float>() : nullptr;
     const L4GroupedPackFP8DispatchRuntime::Args args = {
         .num_ranks = num_ranks,
@@ -211,13 +236,19 @@ static void l4_grouped_pack_fp8_dispatch_out(const torch::Tensor& x,
         .topk_weights = topk_weights_ptr,
         .packed = packed.data_ptr<uint8_t>(),
         .packed_count = packed_count.data_ptr<int>(),
+        .packed_expert_count = packed_expert_count.data_ptr<int>(),
+        .dst_buffer_slot_idx = dst_buffer_slot_idx.data_ptr<int>(),
         .num_tokens = static_cast<int>(x.size(0)),
+        .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .rank_idx = rank_idx,
         .num_experts = num_experts,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 1, false)};
     const auto code = L4GroupedPackFP8DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("l4_grouped_pack_fp8_dispatch", code);
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(packed_count.data_ptr<int>(), 0, num_ranks * sizeof(int),
+                                       at::cuda::getCurrentCUDAStream()));
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(packed_expert_count.data_ptr<int>(), 0,
+                                       packed_expert_count.numel() * sizeof(int),
                                        at::cuda::getCurrentCUDAStream()));
     L4GroupedPackFP8DispatchRuntime::launch(runtime, args, at::cuda::getCurrentCUDAStream());
 }
@@ -228,9 +259,11 @@ static void l4_grouped_check_fp8_dispatch_unpack_args(const torch::Tensor& recv_
                                                       const torch::Tensor& recv_sf,
                                                       const torch::Tensor& recv_topk_idx,
                                                       const torch::Tensor& recv_topk_weights,
-                                                      const torch::Tensor& recv_src_token_idx,
+                                                      const torch::Tensor& recv_src_metadata,
+                                                      const torch::Tensor& recv_expert_count,
                                                       const int& num_tokens_per_rank,
                                                       const int& num_ranks,
+                                                      const int& num_experts,
                                                       const int& num_sms) {
     EP_HOST_ASSERT(recv_buffer.is_cuda() and recv_buffer.is_contiguous());
     EP_HOST_ASSERT(recv_rank_prefix.is_cuda() and recv_rank_prefix.is_contiguous());
@@ -238,16 +271,19 @@ static void l4_grouped_check_fp8_dispatch_unpack_args(const torch::Tensor& recv_
     EP_HOST_ASSERT(recv_sf.is_cuda() and recv_sf.is_contiguous());
     EP_HOST_ASSERT(recv_topk_idx.is_cuda() and recv_topk_idx.is_contiguous());
     EP_HOST_ASSERT(recv_topk_weights.is_cuda() and recv_topk_weights.is_contiguous());
-    EP_HOST_ASSERT(recv_src_token_idx.is_cuda() and recv_src_token_idx.is_contiguous());
+    EP_HOST_ASSERT(recv_src_metadata.is_cuda() and recv_src_metadata.is_contiguous());
+    EP_HOST_ASSERT(recv_expert_count.is_cuda() and recv_expert_count.is_contiguous());
     EP_HOST_ASSERT(recv_buffer.scalar_type() == torch::kByte);
     EP_HOST_ASSERT(recv_rank_prefix.scalar_type() == torch::kInt32 and recv_rank_prefix.numel() == num_ranks + 1);
     EP_HOST_ASSERT(recv_x.dim() == 2 and recv_x.element_size() == 1);
     EP_HOST_ASSERT(recv_sf.dim() == 2 and recv_sf.element_size() == sizeof(sf_pack_t));
     EP_HOST_ASSERT(recv_topk_idx.dim() == 2 and recv_topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
     EP_HOST_ASSERT(recv_topk_weights.dim() == 2 and recv_topk_weights.scalar_type() == torch::kFloat32);
-    EP_HOST_ASSERT(recv_src_token_idx.dim() == 1 and recv_src_token_idx.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(recv_src_metadata.dim() == 2 and recv_src_metadata.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(recv_expert_count.dim() == 1 and recv_expert_count.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(num_tokens_per_rank > 0);
     EP_HOST_ASSERT(num_ranks > 0 and num_ranks <= 32);
+    EP_HOST_ASSERT(num_experts > 0 and num_experts % num_ranks == 0);
     EP_HOST_ASSERT(num_sms > 0);
 
     const int num_recv_tokens = static_cast<int>(recv_x.size(0));
@@ -258,7 +294,8 @@ static void l4_grouped_check_fp8_dispatch_unpack_args(const torch::Tensor& recv_
     EP_HOST_ASSERT(recv_sf.size(0) == num_recv_tokens);
     EP_HOST_ASSERT(recv_topk_idx.size(0) == num_recv_tokens);
     EP_HOST_ASSERT(recv_topk_weights.size(0) == num_recv_tokens and recv_topk_weights.size(1) == num_topk);
-    EP_HOST_ASSERT(recv_src_token_idx.numel() == num_recv_tokens);
+    EP_HOST_ASSERT(recv_src_metadata.size(0) == num_recv_tokens and recv_src_metadata.size(1) == num_topk + 2);
+    EP_HOST_ASSERT(recv_expert_count.numel() == num_experts / num_ranks);
     EP_HOST_ASSERT(hidden_bytes % sizeof(int4) == 0);
     EP_HOST_ASSERT(recv_buffer.numel() >= static_cast<int64_t>(num_ranks) * num_tokens_per_rank * token_bytes);
 }
@@ -269,13 +306,18 @@ static void l4_grouped_unpack_fp8_dispatch_out(const torch::Tensor& recv_buffer,
                                                const torch::Tensor& recv_sf,
                                                const torch::Tensor& recv_topk_idx,
                                                const torch::Tensor& recv_topk_weights,
-                                               const torch::Tensor& recv_src_token_idx,
+                                               const torch::Tensor& recv_src_metadata,
+                                               const torch::Tensor& recv_expert_count,
                                                const int& num_tokens_per_rank,
+                                               const int& rank_idx,
+                                               const int& num_experts,
                                                const int& num_sms) {
     const int num_ranks = static_cast<int>(recv_rank_prefix.numel()) - 1;
     l4_grouped_check_fp8_dispatch_unpack_args(
         recv_buffer, recv_rank_prefix, recv_x, recv_sf, recv_topk_idx,
-        recv_topk_weights, recv_src_token_idx, num_tokens_per_rank, num_ranks, num_sms);
+        recv_topk_weights, recv_src_metadata, recv_expert_count,
+        num_tokens_per_rank, num_ranks, num_experts, num_sms);
+    EP_HOST_ASSERT(rank_idx >= 0 and rank_idx < num_ranks);
 
     constexpr int num_threads = 256;
     const int hidden_bytes = static_cast<int>(recv_x.size(1) * recv_x.element_size());
@@ -294,9 +336,12 @@ static void l4_grouped_unpack_fp8_dispatch_out(const torch::Tensor& recv_buffer,
         .recv_sf = reinterpret_cast<sf_pack_t*>(recv_sf.data_ptr()),
         .recv_topk_idx = recv_topk_idx.data_ptr<topk_idx_t>(),
         .recv_topk_weights = recv_topk_weights.data_ptr<float>(),
-        .recv_src_token_idx = recv_src_token_idx.data_ptr<int>(),
+        .recv_src_metadata = recv_src_metadata.data_ptr<int>(),
+        .recv_expert_count = recv_expert_count.data_ptr<int>(),
         .num_recv_tokens = static_cast<int>(recv_x.size(0)),
         .num_tokens_per_rank = num_tokens_per_rank,
+        .rank_idx = rank_idx,
+        .num_experts = num_experts,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 1, false)};
     const auto code = L4GroupedUnpackFP8DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("l4_grouped_unpack_fp8_dispatch", code);

@@ -403,7 +403,8 @@ public:
 
         // Wait compute stream
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
-        stream_wait(comm_stream, compute_stream);
+        if (comm_stream.id() != compute_stream.id())
+            stream_wait(comm_stream, compute_stream);
 
         // Send data to all ranks
         std::vector<size_t> sizes(num_copies);
@@ -466,17 +467,24 @@ public:
         return {std::move(out), std::move(handle)};
     }
 
-    torch::Tensor l4_p2p_all_to_all_fixed(const torch::Tensor& send, const int64_t& bytes_per_peer) {
+    torch::Tensor l4_p2p_all_to_all_by_bytes(const torch::Tensor& send,
+                                             const int64_t& bytes_per_peer_capacity,
+                                             const std::vector<int64_t>& bytes_per_peer) const {
         EP_HOST_ASSERT(not agrs_in_session and "Do not mix the L4 grouped-P2P microbench with AGRS sessions");
         EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and "This prototype only targets single-node scale-up");
         EP_HOST_ASSERT(send.is_cuda() and send.is_contiguous());
         EP_HOST_ASSERT(send.scalar_type() == torch::kByte);
-        EP_HOST_ASSERT(bytes_per_peer > 0 and bytes_per_peer % 32 == 0);
+        EP_HOST_ASSERT(bytes_per_peer_capacity > 0 and bytes_per_peer_capacity % 32 == 0);
 
         const int num_ranks = nccl_context->num_ranks;
-        const int64_t required_bytes = bytes_per_peer * num_ranks;
+        EP_HOST_ASSERT(static_cast<int>(bytes_per_peer.size()) == num_ranks);
+        const int64_t required_bytes = bytes_per_peer_capacity * num_ranks;
         EP_HOST_ASSERT(send.nbytes() >= required_bytes);
         EP_HOST_ASSERT(required_bytes <= num_buffer_bytes);
+        for (const auto& num_bytes: bytes_per_peer) {
+            EP_HOST_ASSERT(num_bytes >= 0 and num_bytes <= bytes_per_peer_capacity);
+            EP_HOST_ASSERT(num_bytes % 32 == 0);
+        }
 
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
         stream_wait(comm_stream, compute_stream);
@@ -485,24 +493,42 @@ public:
         // only the segment meant for a given destination rank, avoiding the
         // over-send of an all-gather while still using large contiguous P2P
         // DMA transactions.
-        std::vector<size_t> sizes(num_ranks, static_cast<size_t>(bytes_per_peer));
-        std::vector<void*> dst_ptrs(num_ranks), src_ptrs(num_ranks);
+        int num_copies = 0;
+        for (int dst_rank_idx = 0; dst_rank_idx < num_ranks; ++ dst_rank_idx)
+            num_copies += (dst_rank_idx != nccl_context->rank_idx and bytes_per_peer[dst_rank_idx] > 0);
+        std::vector<size_t> sizes(num_copies);
+        std::vector<void*> dst_ptrs(num_copies), src_ptrs(num_copies);
+        int copy_idx = 0;
         for (int dst_rank_idx = 0; dst_rank_idx < num_ranks; ++dst_rank_idx) {
-            src_ptrs[dst_rank_idx] = math::advance_ptr(send.data_ptr(), bytes_per_peer * dst_rank_idx);
-            dst_ptrs[dst_rank_idx] = nccl_context->get_sym_ptr(
-                math::advance_ptr(buffer, bytes_per_peer * nccl_context->rank_idx),
+            if (bytes_per_peer[dst_rank_idx] == 0)
+                continue;
+            auto src_ptr = math::advance_ptr(send.data_ptr(), bytes_per_peer_capacity * dst_rank_idx);
+            auto dst_ptr = nccl_context->get_sym_ptr(
+                math::advance_ptr(buffer, bytes_per_peer_capacity * nccl_context->rank_idx),
                 dst_rank_idx);
+            if (dst_rank_idx == nccl_context->rank_idx) {
+                CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                    dst_ptr, src_ptr, bytes_per_peer[dst_rank_idx],
+                    cudaMemcpyDeviceToDevice, comm_stream));
+            } else {
+                src_ptrs[copy_idx] = src_ptr;
+                dst_ptrs[copy_idx] = dst_ptr;
+                sizes[copy_idx] = static_cast<size_t>(bytes_per_peer[dst_rank_idx]);
+                ++ copy_idx;
+            }
         }
 
-        cudaMemcpyAttributes attrs = {
-            .srcAccessOrder = cudaMemcpySrcAccessOrderStream,
-            .flags = cudaMemcpyFlagPreferOverlapWithCompute
-        };
+        if (num_copies > 0) {
+            cudaMemcpyAttributes attrs = {
+                .srcAccessOrder = cudaMemcpySrcAccessOrderStream,
+                .flags = cudaMemcpyFlagPreferOverlapWithCompute
+            };
 #if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
-        CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_ranks, attrs, comm_stream));
+            CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_copies, attrs, comm_stream));
 #else
-        CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_ranks, attrs, nullptr, comm_stream));
+            CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_copies, attrs, nullptr, comm_stream));
 #endif
+        }
 
         // Some PCIe L4 driver/NCCL window combinations reject host-side
         // stream memory ops on peer-mapped signal addresses. The Gin GPU
@@ -516,12 +542,19 @@ public:
                        num_gpu_timeout_cycles,
                        nccl_context->is_scaleup_nvlink,
                        comm_stream);
-        stream_wait(compute_stream, comm_stream);
+        if (comm_stream.id() != compute_stream.id())
+            stream_wait(compute_stream, comm_stream);
 
         return torch::from_blob(
             buffer,
-            {num_ranks, bytes_per_peer},
+            {num_ranks, bytes_per_peer_capacity},
             torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
+    }
+
+    torch::Tensor l4_p2p_all_to_all_fixed(const torch::Tensor& send, const int64_t& bytes_per_peer) const {
+        return l4_p2p_all_to_all_by_bytes(
+            send, bytes_per_peer,
+            std::vector<int64_t>(nccl_context->num_ranks, bytes_per_peer));
     }
 
     at::cuda::CUDAStream stream_control_prologue(const std::optional<EventHandle>& previous_event,
@@ -544,7 +577,8 @@ public:
         if (previous_event.has_value()) {
             stream_wait(comm_stream, previous_event.value());
         } else {
-            stream_wait(comm_stream, compute_stream);
+            if (comm_stream.id() != compute_stream.id())
+                stream_wait(comm_stream, compute_stream);
         }
         return compute_stream;
     }
@@ -573,7 +607,8 @@ public:
                 }
             }
         } else {
-            stream_wait(compute_stream, comm_stream);
+            if (comm_stream.id() != compute_stream.id())
+                stream_wait(compute_stream, comm_stream);
         }
 
         // Switch back compute stream
@@ -951,6 +986,172 @@ public:
         if (do_handle_copy and not cached_mode) {
             copied_topk_idx = torch::empty_like(topk_idx);
             copied_topk_idx_ptr = copied_topk_idx->data_ptr<topk_idx_t>();
+        }
+
+#if defined(DISABLE_SM90_FEATURES)
+        const bool use_l4_grouped_dispatch =
+            get_env<int>("EP_DISABLE_L4_GROUPED_DISPATCH", 0) == 0 and
+            nccl_context->num_scaleout_ranks == 1 and
+            not cached_mode and not deterministic and not do_expand and do_cpu_sync and
+            sf.has_value() and topk_weights.has_value() and
+            cumulative_local_expert_recv_stats_ptr == nullptr and
+            not use_tma_aligned_col_major_sf and x.element_size() == 1;
+#else
+        const bool use_l4_grouped_dispatch = false;
+#endif
+        if (use_l4_grouped_dispatch) {
+            EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
+            EP_HOST_ASSERT(not allow_hybrid_mode);
+
+            const int num_ranks = nccl_context->num_ranks;
+            const int rank_idx = nccl_context->rank_idx;
+            const int token_bytes = l4_grouped_fp8_dispatch_token_bytes_impl(num_hidden_bytes, num_sf_packs, num_topk);
+            const int64_t bytes_per_peer_capacity = static_cast<int64_t>(num_max_tokens_per_rank) * token_bytes;
+            EP_HOST_ASSERT(bytes_per_peer_capacity * num_ranks <= num_buffer_bytes);
+
+            auto packed = torch::empty(
+                {static_cast<int64_t>(num_ranks) * bytes_per_peer_capacity},
+                torch::TensorOptions(torch::kCUDA).dtype(torch::kByte));
+            auto packed_count = torch::empty(
+                {num_ranks}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            auto packed_expert_count = torch::empty(
+                {num_experts}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+
+            // The grouped SM89 path uses stream-ordered CUDA copy engines for
+            // large rank-major P2P transfers.  All producer kernels and the
+            // copy-engine barriers are issued on the communication stream so
+            // the returned EPHandle remains compatible with the normal v2
+            // combine path.
+            at::cuda::setCurrentCUDAStream(comm_stream);
+            l4_grouped_pack_fp8_dispatch_out(
+                x, sf.value(), topk_idx, topk_weights,
+                packed, packed_count, packed_expert_count, dst_buffer_slot_idx,
+                num_max_tokens_per_rank,
+                rank_idx, num_ranks, num_experts, num_sms);
+
+            if (copied_topk_idx_ptr != nullptr) {
+                CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                    copied_topk_idx_ptr, topk_idx.data_ptr<topk_idx_t>(), topk_idx.nbytes(),
+                    cudaMemcpyDeviceToDevice, comm_stream));
+            }
+
+            std::vector<int> send_counts(num_ranks);
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                send_counts.data(), packed_count.data_ptr<int>(),
+                num_ranks * sizeof(int), cudaMemcpyDeviceToHost, comm_stream));
+            CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
+
+            std::vector<int64_t> send_bytes_per_peer(num_ranks);
+            for (int i = 0; i < num_ranks; ++ i) {
+                EP_HOST_ASSERT(send_counts[i] >= 0 and send_counts[i] <= num_max_tokens_per_rank);
+                send_bytes_per_peer[i] = static_cast<int64_t>(send_counts[i]) * token_bytes;
+            }
+
+            const int64_t header_bytes = math::align<int64_t>(
+                static_cast<int64_t>(num_local_experts + 1) * sizeof(int), 32);
+            const int header_ints = static_cast<int>(header_bytes / sizeof(int));
+            auto count_send = torch::empty(
+                {static_cast<int64_t>(num_ranks) * header_bytes},
+                torch::TensorOptions(torch::kCUDA).dtype(torch::kByte));
+            CUDA_RUNTIME_CHECK(cudaMemsetAsync(count_send.data_ptr(), 0, count_send.nbytes(), comm_stream));
+            for (int i = 0; i < num_ranks; ++ i) {
+                CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                    math::advance_ptr(count_send.data_ptr(), i * header_bytes),
+                    send_counts.data() + i,
+                    sizeof(int), cudaMemcpyHostToDevice, comm_stream));
+                CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                    math::advance_ptr(count_send.data_ptr(), i * header_bytes + sizeof(int)),
+                    packed_expert_count.data_ptr<int>() + i * num_local_experts,
+                    num_local_experts * sizeof(int), cudaMemcpyDeviceToDevice, comm_stream));
+            }
+            auto count_recv = l4_p2p_all_to_all_fixed(count_send, header_bytes);
+            std::vector<int> recv_counts(num_ranks), recv_prefix(num_ranks + 1, 0);
+            std::vector<int> num_recv_tokens_per_expert_list(num_local_experts, 0);
+            std::vector<int> recv_header(num_ranks * header_ints, 0);
+            CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
+            CUDA_RUNTIME_CHECK(cudaMemcpy(
+                recv_header.data(), count_recv.data_ptr(),
+                recv_header.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < num_ranks; ++ i) {
+                recv_counts[i] = recv_header[i * header_ints];
+                EP_HOST_ASSERT(recv_counts[i] >= 0 and recv_counts[i] <= num_max_tokens_per_rank);
+                recv_prefix[i + 1] = recv_prefix[i] + recv_counts[i];
+                for (int j = 0; j < num_local_experts; ++ j)
+                    num_recv_tokens_per_expert_list[j] += recv_header[i * header_ints + 1 + j];
+            }
+            const int num_recv_tokens = recv_prefix[num_ranks];
+
+            auto recv_buffer = l4_p2p_all_to_all_by_bytes(packed, bytes_per_peer_capacity, send_bytes_per_peer);
+
+            auto recv_rank_prefix = torch::empty(
+                {num_ranks + 1}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                recv_rank_prefix.data_ptr<int>(), recv_prefix.data(),
+                (num_ranks + 1) * sizeof(int), cudaMemcpyHostToDevice, comm_stream));
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(), recv_prefix.data() + 1,
+                num_ranks * sizeof(int), cudaMemcpyHostToDevice, comm_stream));
+
+            auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+            auto recv_sf = torch::empty(
+                {num_recv_tokens, num_sf_packs}, sf->options());
+            auto recv_topk_idx = torch::empty(
+                {num_recv_tokens, num_topk}, topk_idx.options());
+            auto recv_topk_weights = torch::empty(
+                {num_recv_tokens, num_topk}, topk_weights->options());
+            auto recv_src_metadata = torch::empty(
+                {num_recv_tokens, num_topk + 2},
+                torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            auto recv_expert_count = torch::empty(
+                {num_local_experts}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+
+            l4_grouped_unpack_fp8_dispatch_out(
+                recv_buffer, recv_rank_prefix,
+                recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
+                recv_src_metadata, recv_expert_count,
+                num_max_tokens_per_rank, rank_idx, num_experts, num_sms);
+
+            std::vector<int> psum_num_recv_tokens_per_expert_host(num_local_experts);
+            int running_expert_count = 0;
+            for (int i = 0; i < num_local_experts; ++ i) {
+                const int aligned_expert_count = math::align<int>(num_recv_tokens_per_expert_list[i], expert_alignment);
+                num_recv_tokens_per_expert_list[i] = aligned_expert_count;
+                running_expert_count += aligned_expert_count;
+                psum_num_recv_tokens_per_expert_host[i] = running_expert_count;
+            }
+            psum_num_recv_tokens_per_expert = torch::empty(
+                {num_local_experts}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                psum_num_recv_tokens_per_expert_host.data(),
+                num_local_experts * sizeof(int), cudaMemcpyHostToDevice, comm_stream));
+
+            if (not allocate_on_comm_stream)
+                at::cuda::setCurrentCUDAStream(compute_stream);
+
+            const auto event = stream_control_epilogue(
+                {x, sf, topk_idx, topk_weights,
+                 packed, packed_count, packed_expert_count, count_send, recv_rank_prefix,
+                 recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
+                 copied_topk_idx,
+                 psum_num_recv_tokens_per_scaleup_rank,
+                 psum_num_recv_tokens_per_expert,
+                 recv_src_metadata,
+                 dst_buffer_slot_idx},
+                compute_stream,
+                allocate_on_comm_stream, async_with_compute_stream);
+
+            return {recv_x, recv_sf,
+                    recv_topk_idx, recv_topk_weights,
+                    copied_topk_idx,
+                    num_recv_tokens_per_expert_list,
+                    psum_num_recv_tokens_per_scaleup_rank,
+                    psum_num_recv_tokens_per_expert,
+                    recv_src_metadata,
+                    dst_buffer_slot_idx,
+                    token_metadata_at_forward,
+                    channel_linked_list,
+                    event};
         }
 
         // Check buffer size
