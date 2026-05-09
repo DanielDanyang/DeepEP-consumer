@@ -98,7 +98,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     pack_once = None
     pack_stats = None
     packed_counts = None
-    if args.mode in ("pack_copy", "pack_copy_unpack"):
+    if args.mode in ("pack_copy", "pack_copy_unpack", "pack_var_copy_unpack"):
         x_fp8, sf, topk_idx, topk_weights = make_dispatch_inputs(rank, args)
         token_bytes = deep_ep._C.l4_grouped_fp8_dispatch_token_bytes(
             args.hidden, sf.size(1), args.num_topk)
@@ -129,7 +129,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     if bytes_per_peer % 32 != 0:
         raise ValueError("--bytes-per-peer must be 32-byte aligned")
     buffer_bytes = args.bytes_per_peer * num_ranks
-    if args.mode in ("pack_copy", "pack_copy_unpack"):
+    if args.mode in ("pack_copy", "pack_copy_unpack", "pack_var_copy_unpack"):
         buffer_bytes = bytes_per_peer * num_ranks
     buffer = deep_ep.ElasticBuffer(
         group,
@@ -147,13 +147,45 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     def p2p_once() -> torch.Tensor:
         return buffer.runtime.l4_p2p_all_to_all_fixed(send, bytes_per_peer)
 
+    send_bytes_per_peer = None
+    if args.mode == "pack_var_copy_unpack":
+        assert packed_counts is not None
+        send_bytes_per_peer = [count * token_bytes for count in packed_counts]
+
+    def var_p2p_once() -> torch.Tensor:
+        assert send_bytes_per_peer is not None
+        return buffer.runtime.l4_p2p_all_to_all_by_bytes(send, bytes_per_peer, send_bytes_per_peer)
+
     def pack_p2p_once() -> torch.Tensor:
         assert pack_once is not None
         pack_once()
         return p2p_once()
 
+    header_stats = None
+    header_once = None
+    if args.mode == "pack_var_copy_unpack":
+        num_local_experts = args.num_experts // num_ranks
+        header_bytes = ((num_local_experts + 1) * 4 + 31) // 32 * 32
+        header_ints = header_bytes // 4
+        count_send = torch.empty((num_ranks * header_bytes,), dtype=torch.uint8, device="cuda")
+        count_send_i32 = count_send.view(torch.int32)
+
+        def fill_header_once() -> None:
+            count_send.zero_()
+            for dst_rank in range(num_ranks):
+                base = dst_rank * header_ints
+                count_send_i32[base].copy_(packed_count[dst_rank])
+                count_send_i32[base + 1:base + 1 + num_local_experts].copy_(
+                    packed_expert_count[dst_rank * num_local_experts:(dst_rank + 1) * num_local_experts])
+
+        def header_once() -> torch.Tensor:
+            fill_header_once()
+            return buffer.runtime.l4_p2p_all_to_all_fixed(count_send, header_bytes)
+
+        fill_header_once()
+
     unpack_once = None
-    if args.mode == "pack_copy_unpack":
+    if args.mode in ("pack_copy_unpack", "pack_var_copy_unpack"):
         gathered_counts = [None for _ in range(num_ranks)]
         dist.all_gather_object(gathered_counts, packed_counts, group=group)
         recv_counts = [int(gathered_counts[src_rank][rank]) for src_rank in range(num_ranks)]
@@ -189,7 +221,15 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             unpack_once(recv_buffer)
             return unpacked_x
 
-    out = p2p_once()
+        def pack_header_var_p2p_unpack_once() -> torch.Tensor:
+            assert pack_once is not None and header_once is not None
+            pack_once()
+            header_once()
+            recv_buffer = var_p2p_once()
+            unpack_once(recv_buffer)
+            return unpacked_x
+
+    out = var_p2p_once() if args.mode == "pack_var_copy_unpack" else p2p_once()
     torch.cuda.synchronize()
     if args.check and args.mode == "fixed_copy":
         check_output(out, rank, bytes_per_peer)
@@ -198,16 +238,25 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         unpack_once(out)
         torch.cuda.synchronize()
 
-    copy_stats = time_cuda(p2p_once, args.warmups, args.iters)
+    copy_target = var_p2p_once if args.mode == "pack_var_copy_unpack" else p2p_once
+    copy_stats = time_cuda(copy_target, args.warmups, args.iters)
+    if header_once is not None:
+        header_stats = time_cuda(header_once, args.warmups, args.iters)
     unpack_stats = time_cuda(lambda: unpack_once(out), args.warmups, args.iters) if unpack_once is not None else None
-    if args.mode == "pack_copy_unpack":
+    if args.mode == "pack_var_copy_unpack":
+        e2e_stats = time_cuda(pack_header_var_p2p_unpack_once, args.warmups, args.iters)
+    elif args.mode == "pack_copy_unpack":
         e2e_stats = time_cuda(pack_p2p_unpack_once, args.warmups, args.iters)
     elif args.mode == "pack_copy":
         e2e_stats = time_cuda(pack_p2p_once, args.warmups, args.iters)
     else:
         e2e_stats = None
-    send_bytes = bytes_per_peer * num_ranks
-    recv_bytes = bytes_per_peer * num_ranks
+    if args.mode == "pack_var_copy_unpack":
+        send_bytes = sum(send_bytes_per_peer)
+        recv_bytes = sum(recv_counts) * token_bytes
+    else:
+        send_bytes = bytes_per_peer * num_ranks
+        recv_bytes = bytes_per_peer * num_ranks
     local = {
         "backend": "deepep_l4_grouped_p2p_copy_engine",
         "mode": args.mode,
@@ -240,6 +289,11 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             "unpack_median_us": unpack_stats["median_s"] * 1e6,
             "unpack_p90_us": unpack_stats["p90_s"] * 1e6,
         })
+    if header_stats is not None:
+        local.update({
+            "header_median_us": header_stats["median_s"] * 1e6,
+            "header_p90_us": header_stats["p90_s"] * 1e6,
+        })
 
     gathered = [None for _ in range(num_ranks)]
     dist.all_gather_object(gathered, local, group=group)
@@ -263,7 +317,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             "copy_bidirectional_gbs_median": statistics.median(bidir),
             "ranks": gathered,
         }
-        if args.mode in ("pack_copy", "pack_copy_unpack"):
+        if args.mode in ("pack_copy", "pack_copy_unpack", "pack_var_copy_unpack"):
             pack_medians = [row["pack_median_us"] for row in gathered]
             e2e_medians = [row["e2e_median_us"] for row in gathered]
             result.update({
@@ -281,6 +335,17 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                     "unpack_median_us_min": min(unpack_medians),
                     "unpack_median_us_max": max(unpack_medians),
                 })
+            if args.mode == "pack_var_copy_unpack":
+                unpack_medians = [row["unpack_median_us"] for row in gathered]
+                header_medians = [row["header_median_us"] for row in gathered]
+                result.update({
+                    "unpack_median_us_median": statistics.median(unpack_medians),
+                    "unpack_median_us_min": min(unpack_medians),
+                    "unpack_median_us_max": max(unpack_medians),
+                    "header_median_us_median": statistics.median(header_medians),
+                    "header_median_us_min": min(header_medians),
+                    "header_median_us_max": max(header_medians),
+                })
         print(json.dumps(result, sort_keys=True), flush=True)
 
     buffer.destroy()
@@ -294,7 +359,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-processes", type=int, default=4)
     parser.add_argument("--num-ranks", type=int, default=0)
     parser.add_argument("--mode", type=str, default="fixed_copy",
-                        choices=["fixed_copy", "pack_copy", "pack_copy_unpack"])
+                        choices=["fixed_copy", "pack_copy", "pack_copy_unpack", "pack_var_copy_unpack"])
     parser.add_argument("--payload", type=str, default="dispatch_fp8",
                         choices=["dispatch_fp8", "combine_bf16", "custom"])
     parser.add_argument("--bytes-per-peer", type=int, default=56_141_280)

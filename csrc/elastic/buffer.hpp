@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <pybind11/functional.h>
+#include <pybind11/stl.h>
 
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/compiled.cuh>
@@ -1550,6 +1551,7 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("l4_p2p_all_to_all_fixed", &ElasticBuffer::l4_p2p_all_to_all_fixed)
+        .def("l4_p2p_all_to_all_by_bytes", &ElasticBuffer::l4_p2p_all_to_all_by_bytes)
         .def("dispatch", &ElasticBuffer::dispatch)
         .def("combine", &ElasticBuffer::combine);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);

@@ -150,7 +150,28 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     assert recv_topk_weights.shape == (sum(recv_counts), args.num_topk)
     assert src_metadata.shape == (sum(recv_counts), args.num_topk + 2)
 
+    def payload_once():
+        recv_x_ = all_to_all_tensor(packed_inputs[0], send_counts, recv_counts, args.hidden, group)
+        recv_sf_ = all_to_all_tensor(packed_inputs[1], send_counts, recv_counts, sf.size(1), group)
+        recv_topk_idx_ = all_to_all_tensor(packed_inputs[2], send_counts, recv_counts, args.num_topk, group)
+        recv_topk_weights_ = all_to_all_tensor(packed_inputs[3], send_counts, recv_counts, args.num_topk, group)
+        recv_src_ = all_to_all_tensor(packed_inputs[4].view(-1, 1), send_counts, recv_counts, 1, group).view(-1)
+        return recv_x_, recv_sf_, recv_topk_idx_, recv_topk_weights_, recv_src_
+
+    packed_inputs, send_counts = pack_by_rank(x_fp8, sf, topk_idx, topk_weights, src, num_ranks, args.num_experts)
+    recv_counts = exchange_counts(send_counts, group)
+    recv_payload = payload_once()
+    torch.cuda.synchronize()
+
     stats = time_cuda(ep_once, args.warmups, args.iters)
+    pack_stats = time_cuda(
+        lambda: pack_by_rank(x_fp8, sf, topk_idx, topk_weights, src, num_ranks, args.num_experts),
+        args.warmups, args.iters)
+    count_stats = time_cuda(lambda: exchange_counts(send_counts, group), args.warmups, args.iters)
+    payload_stats = time_cuda(payload_once, args.warmups, args.iters)
+    unpack_stats = time_cuda(
+        lambda: unpack_ep(recv_payload[2], recv_payload[3], recv_payload[4], rank, num_ranks, args.num_experts),
+        args.warmups, args.iters)
     local_bytes = count_bytes(recv_x, recv_sf, recv_topk_idx, recv_topk_weights, src_metadata)
     local = {
         "backend": "pytorch_ep_pack_all_to_all_unpack",
@@ -163,12 +184,20 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         "median_us": stats["median_s"] * 1e6,
         "p90_us": stats["p90_s"] * 1e6,
         "recv_gbs": local_bytes / 1e9 / stats["median_s"],
+        "pack_median_us": pack_stats["median_s"] * 1e6,
+        "count_exchange_median_us": count_stats["median_s"] * 1e6,
+        "payload_all_to_all_median_us": payload_stats["median_s"] * 1e6,
+        "unpack_median_us": unpack_stats["median_s"] * 1e6,
     }
     gathered = [None for _ in range(num_ranks)]
     dist.all_gather_object(gathered, local, group=group)
     if rank == 0:
         medians = [row["median_us"] for row in gathered]
         recv_gbs = [row["recv_gbs"] for row in gathered]
+        pack_medians = [row["pack_median_us"] for row in gathered]
+        count_medians = [row["count_exchange_median_us"] for row in gathered]
+        payload_medians = [row["payload_all_to_all_median_us"] for row in gathered]
+        unpack_medians = [row["unpack_median_us"] for row in gathered]
         result = {
             "backend": "pytorch_ep_pack_all_to_all_unpack",
             "rank_count": num_ranks,
@@ -184,6 +213,10 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             "recv_gbs_min": min(recv_gbs),
             "recv_gbs_max": max(recv_gbs),
             "recv_gbs_median": statistics.median(recv_gbs),
+            "pack_median_us_median": statistics.median(pack_medians),
+            "count_exchange_median_us_median": statistics.median(count_medians),
+            "payload_all_to_all_median_us_median": statistics.median(payload_medians),
+            "unpack_median_us_median": statistics.median(unpack_medians),
             "ranks": gathered,
         }
         print(json.dumps(result, sort_keys=True), flush=True)
