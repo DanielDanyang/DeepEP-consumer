@@ -466,6 +466,64 @@ public:
         return {std::move(out), std::move(handle)};
     }
 
+    torch::Tensor l4_p2p_all_to_all_fixed(const torch::Tensor& send, const int64_t& bytes_per_peer) {
+        EP_HOST_ASSERT(not agrs_in_session and "Do not mix the L4 grouped-P2P microbench with AGRS sessions");
+        EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and "This prototype only targets single-node scale-up");
+        EP_HOST_ASSERT(send.is_cuda() and send.is_contiguous());
+        EP_HOST_ASSERT(send.scalar_type() == torch::kByte);
+        EP_HOST_ASSERT(bytes_per_peer > 0 and bytes_per_peer % 32 == 0);
+
+        const int num_ranks = nccl_context->num_ranks;
+        const int64_t required_bytes = bytes_per_peer * num_ranks;
+        EP_HOST_ASSERT(send.nbytes() >= required_bytes);
+        EP_HOST_ASSERT(required_bytes <= num_buffer_bytes);
+
+        const auto compute_stream = at::cuda::getCurrentCUDAStream();
+        stream_wait(comm_stream, compute_stream);
+
+        // Receiver layout is `[src_rank, bytes_per_peer]`. Each rank copies
+        // only the segment meant for a given destination rank, avoiding the
+        // over-send of an all-gather while still using large contiguous P2P
+        // DMA transactions.
+        std::vector<size_t> sizes(num_ranks, static_cast<size_t>(bytes_per_peer));
+        std::vector<void*> dst_ptrs(num_ranks), src_ptrs(num_ranks);
+        for (int dst_rank_idx = 0; dst_rank_idx < num_ranks; ++dst_rank_idx) {
+            src_ptrs[dst_rank_idx] = math::advance_ptr(send.data_ptr(), bytes_per_peer * dst_rank_idx);
+            dst_ptrs[dst_rank_idx] = nccl_context->get_sym_ptr(
+                math::advance_ptr(buffer, bytes_per_peer * nccl_context->rank_idx),
+                dst_rank_idx);
+        }
+
+        cudaMemcpyAttributes attrs = {
+            .srcAccessOrder = cudaMemcpySrcAccessOrderStream,
+            .flags = cudaMemcpyFlagPreferOverlapWithCompute
+        };
+#if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
+        CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_ranks, attrs, comm_stream));
+#else
+        CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_ranks, attrs, nullptr, comm_stream));
+#endif
+
+        // Some PCIe L4 driver/NCCL window combinations reject host-side
+        // stream memory ops on peer-mapped signal addresses. The Gin GPU
+        // barrier is already the validated SM89 scale-up synchronization path,
+        // so use it here to isolate payload-copy performance from signal API
+        // support.
+        launch_barrier(nccl_context->dev_comm, nccl_context->window,
+                       workspace,
+                       nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
+                       nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                       num_gpu_timeout_cycles,
+                       nccl_context->is_scaleup_nvlink,
+                       comm_stream);
+        stream_wait(compute_stream, comm_stream);
+
+        return torch::from_blob(
+            buffer,
+            {num_ranks, bytes_per_peer},
+            torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
+    }
+
     at::cuda::CUDAStream stream_control_prologue(const std::optional<EventHandle>& previous_event,
                                                  const bool& allocate_on_comm_stream,
                                                  const bool& async_with_compute_stream) const {
@@ -1290,6 +1348,7 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_set_config", &ElasticBuffer::agrs_set_config)
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
+        .def("l4_p2p_all_to_all_fixed", &ElasticBuffer::l4_p2p_all_to_all_fixed)
         .def("dispatch", &ElasticBuffer::dispatch)
         .def("combine", &ElasticBuffer::combine);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
@@ -1308,6 +1367,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("host_staging_pack_fp8_dispatch_out", &host_staging_pack_fp8_dispatch_out);
     m.def("host_staging_pack_bf16_combine", &host_staging_pack_bf16_combine);
     m.def("host_staging_pack_bf16_combine_out", &host_staging_pack_bf16_combine_out);
+
+    // L4 grouped-P2P single-node prototype building blocks
+    m.def("l4_grouped_fp8_dispatch_token_bytes", &l4_grouped_fp8_dispatch_token_bytes);
+    m.def("l4_grouped_pack_fp8_dispatch_out", &l4_grouped_pack_fp8_dispatch_out);
 }
 
 }  // namespace deep_ep
