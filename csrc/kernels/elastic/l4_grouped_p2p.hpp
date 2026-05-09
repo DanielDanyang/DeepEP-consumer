@@ -76,6 +76,61 @@ static void __instantiate_kernel() {{
     }
 };
 
+class L4GroupedUnpackFP8DispatchRuntime final : public jit::LaunchRuntime<L4GroupedUnpackFP8DispatchRuntime> {
+public:
+    struct Args {
+        int num_ranks;
+        int hidden_bytes;
+        int num_sf_packs;
+        int num_topk;
+        int token_bytes;
+
+        const uint8_t* recv_buffer;
+        const int* recv_rank_prefix;
+        void* recv_x;
+        sf_pack_t* recv_sf;
+        topk_idx_t* recv_topk_idx;
+        float* recv_topk_weights;
+        int* recv_src_token_idx;
+        int num_recv_tokens;
+        int num_tokens_per_rank;
+
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/l4_grouped_p2p.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&l4_grouped_unpack_fp8_dispatch_impl<{}, {}, {}, {}, {}, {}>);
+}}
+)",
+                           args.launch_args.num_threads,
+                           args.num_ranks,
+                           args.hidden_bytes,
+                           args.num_sf_packs,
+                           args.num_topk,
+                           args.token_bytes);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.recv_buffer,
+            args.recv_rank_prefix,
+            args.recv_x,
+            args.recv_sf,
+            args.recv_topk_idx,
+            args.recv_topk_weights,
+            args.recv_src_token_idx,
+            args.num_recv_tokens,
+            args.num_tokens_per_rank));
+    }
+};
+
 static void l4_grouped_check_fp8_dispatch_pack_args(const torch::Tensor& x,
                                                     const torch::Tensor& sf,
                                                     const torch::Tensor& topk_idx,
@@ -165,6 +220,87 @@ static void l4_grouped_pack_fp8_dispatch_out(const torch::Tensor& x,
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(packed_count.data_ptr<int>(), 0, num_ranks * sizeof(int),
                                        at::cuda::getCurrentCUDAStream()));
     L4GroupedPackFP8DispatchRuntime::launch(runtime, args, at::cuda::getCurrentCUDAStream());
+}
+
+static void l4_grouped_check_fp8_dispatch_unpack_args(const torch::Tensor& recv_buffer,
+                                                      const torch::Tensor& recv_rank_prefix,
+                                                      const torch::Tensor& recv_x,
+                                                      const torch::Tensor& recv_sf,
+                                                      const torch::Tensor& recv_topk_idx,
+                                                      const torch::Tensor& recv_topk_weights,
+                                                      const torch::Tensor& recv_src_token_idx,
+                                                      const int& num_tokens_per_rank,
+                                                      const int& num_ranks,
+                                                      const int& num_sms) {
+    EP_HOST_ASSERT(recv_buffer.is_cuda() and recv_buffer.is_contiguous());
+    EP_HOST_ASSERT(recv_rank_prefix.is_cuda() and recv_rank_prefix.is_contiguous());
+    EP_HOST_ASSERT(recv_x.is_cuda() and recv_x.is_contiguous());
+    EP_HOST_ASSERT(recv_sf.is_cuda() and recv_sf.is_contiguous());
+    EP_HOST_ASSERT(recv_topk_idx.is_cuda() and recv_topk_idx.is_contiguous());
+    EP_HOST_ASSERT(recv_topk_weights.is_cuda() and recv_topk_weights.is_contiguous());
+    EP_HOST_ASSERT(recv_src_token_idx.is_cuda() and recv_src_token_idx.is_contiguous());
+    EP_HOST_ASSERT(recv_buffer.scalar_type() == torch::kByte);
+    EP_HOST_ASSERT(recv_rank_prefix.scalar_type() == torch::kInt32 and recv_rank_prefix.numel() == num_ranks + 1);
+    EP_HOST_ASSERT(recv_x.dim() == 2 and recv_x.element_size() == 1);
+    EP_HOST_ASSERT(recv_sf.dim() == 2 and recv_sf.element_size() == sizeof(sf_pack_t));
+    EP_HOST_ASSERT(recv_topk_idx.dim() == 2 and recv_topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+    EP_HOST_ASSERT(recv_topk_weights.dim() == 2 and recv_topk_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(recv_src_token_idx.dim() == 1 and recv_src_token_idx.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(num_tokens_per_rank > 0);
+    EP_HOST_ASSERT(num_ranks > 0 and num_ranks <= 32);
+    EP_HOST_ASSERT(num_sms > 0);
+
+    const int num_recv_tokens = static_cast<int>(recv_x.size(0));
+    const int hidden_bytes = static_cast<int>(recv_x.size(1) * recv_x.element_size());
+    const int num_sf_packs = static_cast<int>(recv_sf.size(1));
+    const int num_topk = static_cast<int>(recv_topk_idx.size(1));
+    const int token_bytes = l4_grouped_fp8_dispatch_token_bytes_impl(hidden_bytes, num_sf_packs, num_topk);
+    EP_HOST_ASSERT(recv_sf.size(0) == num_recv_tokens);
+    EP_HOST_ASSERT(recv_topk_idx.size(0) == num_recv_tokens);
+    EP_HOST_ASSERT(recv_topk_weights.size(0) == num_recv_tokens and recv_topk_weights.size(1) == num_topk);
+    EP_HOST_ASSERT(recv_src_token_idx.numel() == num_recv_tokens);
+    EP_HOST_ASSERT(hidden_bytes % sizeof(int4) == 0);
+    EP_HOST_ASSERT(recv_buffer.numel() >= static_cast<int64_t>(num_ranks) * num_tokens_per_rank * token_bytes);
+}
+
+static void l4_grouped_unpack_fp8_dispatch_out(const torch::Tensor& recv_buffer,
+                                               const torch::Tensor& recv_rank_prefix,
+                                               const torch::Tensor& recv_x,
+                                               const torch::Tensor& recv_sf,
+                                               const torch::Tensor& recv_topk_idx,
+                                               const torch::Tensor& recv_topk_weights,
+                                               const torch::Tensor& recv_src_token_idx,
+                                               const int& num_tokens_per_rank,
+                                               const int& num_sms) {
+    const int num_ranks = static_cast<int>(recv_rank_prefix.numel()) - 1;
+    l4_grouped_check_fp8_dispatch_unpack_args(
+        recv_buffer, recv_rank_prefix, recv_x, recv_sf, recv_topk_idx,
+        recv_topk_weights, recv_src_token_idx, num_tokens_per_rank, num_ranks, num_sms);
+
+    constexpr int num_threads = 256;
+    const int hidden_bytes = static_cast<int>(recv_x.size(1) * recv_x.element_size());
+    const int num_sf_packs = static_cast<int>(recv_sf.size(1));
+    const int num_topk = static_cast<int>(recv_topk_idx.size(1));
+    const int token_bytes = l4_grouped_fp8_dispatch_token_bytes_impl(hidden_bytes, num_sf_packs, num_topk);
+    const L4GroupedUnpackFP8DispatchRuntime::Args args = {
+        .num_ranks = num_ranks,
+        .hidden_bytes = hidden_bytes,
+        .num_sf_packs = num_sf_packs,
+        .num_topk = num_topk,
+        .token_bytes = token_bytes,
+        .recv_buffer = recv_buffer.data_ptr<uint8_t>(),
+        .recv_rank_prefix = recv_rank_prefix.data_ptr<int>(),
+        .recv_x = recv_x.data_ptr(),
+        .recv_sf = reinterpret_cast<sf_pack_t*>(recv_sf.data_ptr()),
+        .recv_topk_idx = recv_topk_idx.data_ptr<topk_idx_t>(),
+        .recv_topk_weights = recv_topk_weights.data_ptr<float>(),
+        .recv_src_token_idx = recv_src_token_idx.data_ptr<int>(),
+        .num_recv_tokens = static_cast<int>(recv_x.size(0)),
+        .num_tokens_per_rank = num_tokens_per_rank,
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, 0, 1, false)};
+    const auto code = L4GroupedUnpackFP8DispatchRuntime::generate(args);
+    const auto runtime = jit::compiler->build("l4_grouped_unpack_fp8_dispatch", code);
+    L4GroupedUnpackFP8DispatchRuntime::launch(runtime, args, at::cuda::getCurrentCUDAStream());
 }
 
 }  // namespace deep_ep::elastic

@@ -98,7 +98,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     pack_once = None
     pack_stats = None
     packed_counts = None
-    if args.mode == "pack_copy":
+    if args.mode in ("pack_copy", "pack_copy_unpack"):
         x_fp8, sf, topk_idx, topk_weights = make_dispatch_inputs(rank, args)
         token_bytes = deep_ep._C.l4_grouped_fp8_dispatch_token_bytes(
             args.hidden, sf.size(1), args.num_topk)
@@ -127,7 +127,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     if bytes_per_peer % 32 != 0:
         raise ValueError("--bytes-per-peer must be 32-byte aligned")
     buffer_bytes = args.bytes_per_peer * num_ranks
-    if args.mode == "pack_copy":
+    if args.mode in ("pack_copy", "pack_copy_unpack"):
         buffer_bytes = bytes_per_peer * num_ranks
     buffer = deep_ep.ElasticBuffer(
         group,
@@ -150,14 +150,56 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         pack_once()
         return p2p_once()
 
+    unpack_once = None
+    if args.mode == "pack_copy_unpack":
+        gathered_counts = [None for _ in range(num_ranks)]
+        dist.all_gather_object(gathered_counts, packed_counts, group=group)
+        recv_counts = [int(gathered_counts[src_rank][rank]) for src_rank in range(num_ranks)]
+        recv_prefix_cpu = [0]
+        for count in recv_counts:
+            recv_prefix_cpu.append(recv_prefix_cpu[-1] + count)
+        recv_rank_prefix = torch.tensor(recv_prefix_cpu, dtype=torch.int32, device="cuda")
+        num_recv_tokens = recv_prefix_cpu[-1]
+        unpacked_x = torch.empty((num_recv_tokens, args.hidden), dtype=torch.uint8, device="cuda")
+        unpacked_sf = torch.empty((num_recv_tokens, (args.hidden + 127) // 128), dtype=torch.float32, device="cuda")
+        unpacked_topk_idx = torch.empty((num_recv_tokens, args.num_topk), dtype=topk_idx.dtype, device="cuda")
+        unpacked_topk_weights = torch.empty((num_recv_tokens, args.num_topk), dtype=torch.float32, device="cuda")
+        unpacked_src_token_idx = torch.empty((num_recv_tokens,), dtype=torch.int32, device="cuda")
+
+        def unpack_once(recv_buffer: torch.Tensor) -> None:
+            deep_ep._C.l4_grouped_unpack_fp8_dispatch_out(
+                recv_buffer,
+                recv_rank_prefix,
+                unpacked_x,
+                unpacked_sf,
+                unpacked_topk_idx,
+                unpacked_topk_weights,
+                unpacked_src_token_idx,
+                args.num_tokens,
+                args.num_sms)
+
+        def pack_p2p_unpack_once() -> torch.Tensor:
+            recv_buffer = pack_p2p_once()
+            unpack_once(recv_buffer)
+            return unpacked_x
+
     out = p2p_once()
     torch.cuda.synchronize()
     if args.check and args.mode == "fixed_copy":
         check_output(out, rank, bytes_per_peer)
         torch.cuda.synchronize()
+    if unpack_once is not None:
+        unpack_once(out)
+        torch.cuda.synchronize()
 
     copy_stats = time_cuda(p2p_once, args.warmups, args.iters)
-    e2e_stats = time_cuda(pack_p2p_once, args.warmups, args.iters) if args.mode == "pack_copy" else None
+    unpack_stats = time_cuda(lambda: unpack_once(out), args.warmups, args.iters) if unpack_once is not None else None
+    if args.mode == "pack_copy_unpack":
+        e2e_stats = time_cuda(pack_p2p_unpack_once, args.warmups, args.iters)
+    elif args.mode == "pack_copy":
+        e2e_stats = time_cuda(pack_p2p_once, args.warmups, args.iters)
+    else:
+        e2e_stats = None
     send_bytes = bytes_per_peer * num_ranks
     recv_bytes = bytes_per_peer * num_ranks
     local = {
@@ -187,6 +229,11 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             "e2e_p90_us": e2e_stats["p90_s"] * 1e6,
             "e2e_bidirectional_gbs": (send_bytes + recv_bytes) / 1e9 / e2e_stats["median_s"],
         })
+    if unpack_stats is not None:
+        local.update({
+            "unpack_median_us": unpack_stats["median_s"] * 1e6,
+            "unpack_p90_us": unpack_stats["p90_s"] * 1e6,
+        })
 
     gathered = [None for _ in range(num_ranks)]
     dist.all_gather_object(gathered, local, group=group)
@@ -210,7 +257,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             "copy_bidirectional_gbs_median": statistics.median(bidir),
             "ranks": gathered,
         }
-        if args.mode == "pack_copy":
+        if args.mode in ("pack_copy", "pack_copy_unpack"):
             pack_medians = [row["pack_median_us"] for row in gathered]
             e2e_medians = [row["e2e_median_us"] for row in gathered]
             result.update({
@@ -221,6 +268,13 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                 "e2e_median_us_min": min(e2e_medians),
                 "e2e_median_us_max": max(e2e_medians),
             })
+            if args.mode == "pack_copy_unpack":
+                unpack_medians = [row["unpack_median_us"] for row in gathered]
+                result.update({
+                    "unpack_median_us_median": statistics.median(unpack_medians),
+                    "unpack_median_us_min": min(unpack_medians),
+                    "unpack_median_us_max": max(unpack_medians),
+                })
         print(json.dumps(result, sort_keys=True), flush=True)
 
     buffer.destroy()
@@ -233,7 +287,8 @@ if __name__ == "__main__":
         description="DeepEP L4 grouped P2P fixed-size all-to-all transport microbench")
     parser.add_argument("--num-processes", type=int, default=4)
     parser.add_argument("--num-ranks", type=int, default=0)
-    parser.add_argument("--mode", type=str, default="fixed_copy", choices=["fixed_copy", "pack_copy"])
+    parser.add_argument("--mode", type=str, default="fixed_copy",
+                        choices=["fixed_copy", "pack_copy", "pack_copy_unpack"])
     parser.add_argument("--payload", type=str, default="dispatch_fp8",
                         choices=["dispatch_fp8", "combine_bf16", "custom"])
     parser.add_argument("--bytes-per-peer", type=int, default=56_141_280)

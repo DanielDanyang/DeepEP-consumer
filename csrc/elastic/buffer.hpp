@@ -1371,6 +1371,7 @@ static void register_apis(pybind11::module_& m) {
     // L4 grouped-P2P single-node prototype building blocks
     m.def("l4_grouped_fp8_dispatch_token_bytes", &l4_grouped_fp8_dispatch_token_bytes);
     m.def("l4_grouped_pack_fp8_dispatch_out", &l4_grouped_pack_fp8_dispatch_out);
+    m.def("l4_grouped_unpack_fp8_dispatch_out", &l4_grouped_unpack_fp8_dispatch_out);
 }
 
 }  // namespace deep_ep
