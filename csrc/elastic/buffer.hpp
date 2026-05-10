@@ -544,11 +544,53 @@ public:
                 .srcAccessOrder = cudaMemcpySrcAccessOrderStream,
                 .flags = cudaMemcpyFlagPreferOverlapWithCompute
             };
+            const auto launch_batch = [&](std::vector<void*>& batch_dst_ptrs,
+                                          std::vector<void*>& batch_src_ptrs,
+                                          std::vector<size_t>& batch_sizes,
+                                          const at::cuda::CUDAStream& batch_stream) {
+                if (batch_sizes.empty())
+                    return;
 #if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
-            CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_copies, attrs, stream));
+                CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(
+                    batch_dst_ptrs.data(), batch_src_ptrs.data(), batch_sizes.data(),
+                    static_cast<unsigned int>(batch_sizes.size()), attrs, batch_stream));
 #else
-            CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_copies, attrs, nullptr, stream));
+                CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(
+                    batch_dst_ptrs.data(), batch_src_ptrs.data(), batch_sizes.data(),
+                    static_cast<unsigned int>(batch_sizes.size()), attrs, nullptr, batch_stream));
 #endif
+            };
+
+            const int num_copy_streams = std::min(
+                num_copies, std::max(1, get_env<int>("EP_L4_GROUPED_COPY_STREAMS", 4)));
+            if (num_copy_streams == 1) {
+                launch_batch(dst_ptrs, src_ptrs, sizes, stream);
+            } else {
+                // CUDA can overlap independent peer copies on this PCIe L4 target. The default
+                // env value maps to one stream per remote peer on the 4-GPU node after clamping
+                // by `num_copies`, but the synchronization point must remain single-shot: every
+                // peer stream joins the caller stream before the Gin barrier publishes
+                // remote-write visibility.
+                std::vector<at::cuda::CUDAStream> peer_streams;
+                std::vector<std::vector<void*>> grouped_src_ptrs(num_copy_streams);
+                std::vector<std::vector<void*>> grouped_dst_ptrs(num_copy_streams);
+                std::vector<std::vector<size_t>> grouped_sizes(num_copy_streams);
+                peer_streams.reserve(num_copy_streams);
+                for (int i = 0; i < num_copy_streams; ++ i) {
+                    peer_streams.push_back(at::cuda::getStreamFromPool(true));
+                    stream_wait(peer_streams.back(), stream);
+                }
+                for (int i = 0; i < num_copies; ++ i) {
+                    const int stream_idx = i % num_copy_streams;
+                    grouped_src_ptrs[stream_idx].push_back(src_ptrs[i]);
+                    grouped_dst_ptrs[stream_idx].push_back(dst_ptrs[i]);
+                    grouped_sizes[stream_idx].push_back(sizes[i]);
+                }
+                for (int i = 0; i < num_copy_streams; ++ i)
+                    launch_batch(grouped_dst_ptrs[i], grouped_src_ptrs[i], grouped_sizes[i], peer_streams[i]);
+                for (const auto& peer_stream: peer_streams)
+                    stream_wait(stream, peer_stream);
+            }
         }
 
         // Some PCIe L4 driver/NCCL window combinations reject host-side
@@ -1146,12 +1188,16 @@ public:
                 for (int chunk_idx = 0; chunk_idx < num_l4_chunks; ++ chunk_idx) {
                     const int token_begin = math::ceil_div(num_max_tokens_per_rank * chunk_idx, num_l4_chunks);
                     const int token_end = math::ceil_div(num_max_tokens_per_rank * (chunk_idx + 1), num_l4_chunks);
-                    const int64_t byte_begin = static_cast<int64_t>(token_begin) * token_bytes;
-                    const int64_t byte_end = static_cast<int64_t>(token_end) * token_bytes;
-                    std::vector<int64_t> chunk_offsets(num_ranks, byte_begin);
+                    std::vector<int64_t> chunk_offsets(num_ranks, 0);
                     std::vector<int64_t> chunk_bytes(num_ranks, 0);
                     for (int peer_idx = 0; peer_idx < num_ranks; ++ peer_idx) {
-                        const int peer_count = (peer_idx == rank_idx) ? recv_counts[peer_idx] : send_counts[peer_idx];
+                        // The self-rank payload is already in the local packed buffer at the
+                        // destination-rank slot. Copying it through the symmetric staging buffer
+                        // only burns local D2D bandwidth, so the chunked path unpacks self tokens
+                        // directly from `packed` and reserves the copy engine for remote peers.
+                        if (peer_idx == rank_idx)
+                            continue;
+                        const int peer_count = send_counts[peer_idx];
                         const int peer_chunk_begin = std::min(token_begin, peer_count);
                         const int peer_chunk_end = std::min(token_end, peer_count);
                         chunk_offsets[peer_idx] = static_cast<int64_t>(peer_chunk_begin) * token_bytes;
@@ -1161,9 +1207,23 @@ public:
                     l4_p2p_all_to_all_by_bytes_at_offsets(
                         packed, bytes_per_peer_capacity, chunk_offsets, chunk_bytes,
                         copy_stream, false, false);
+
+                    const int self_chunk_begin = std::min(token_begin, recv_counts[rank_idx]);
+                    const int self_chunk_end = std::min(token_end, recv_counts[rank_idx]);
+                    if (self_chunk_end > self_chunk_begin) {
+                        l4_grouped_unpack_fp8_dispatch_range_out(
+                            packed, recv_rank_prefix,
+                            recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
+                            recv_src_metadata, recv_expert_count,
+                            num_max_tokens_per_rank, rank_idx, num_experts,
+                            recv_prefix[rank_idx] + self_chunk_begin,
+                            self_chunk_end - self_chunk_begin, num_sms);
+                    }
                     stream_wait(comm_stream, copy_stream);
 
                     for (int src_rank_idx = 0; src_rank_idx < num_ranks; ++ src_rank_idx) {
+                        if (src_rank_idx == rank_idx)
+                            continue;
                         const int src_count = recv_counts[src_rank_idx];
                         const int src_chunk_begin = std::min(token_begin, src_count);
                         const int src_chunk_end = std::min(token_end, src_count);
