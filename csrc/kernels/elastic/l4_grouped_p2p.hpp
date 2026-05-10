@@ -99,7 +99,8 @@ public:
         float* recv_topk_weights;
         int* recv_src_metadata;
         int* recv_expert_count;
-        int num_recv_tokens;
+        int start_recv_token;
+        int num_unpack_tokens;
         int num_tokens_per_rank;
         int rank_idx;
         int num_experts;
@@ -136,7 +137,8 @@ static void __instantiate_kernel() {{
             args.recv_topk_weights,
             args.recv_src_metadata,
             args.recv_expert_count,
-            args.num_recv_tokens,
+            args.start_recv_token,
+            args.num_unpack_tokens,
             args.num_tokens_per_rank,
             args.rank_idx,
             args.num_experts));
@@ -300,24 +302,28 @@ static void l4_grouped_check_fp8_dispatch_unpack_args(const torch::Tensor& recv_
     EP_HOST_ASSERT(recv_buffer.numel() >= static_cast<int64_t>(num_ranks) * num_tokens_per_rank * token_bytes);
 }
 
-static void l4_grouped_unpack_fp8_dispatch_out(const torch::Tensor& recv_buffer,
-                                               const torch::Tensor& recv_rank_prefix,
-                                               const torch::Tensor& recv_x,
-                                               const torch::Tensor& recv_sf,
-                                               const torch::Tensor& recv_topk_idx,
-                                               const torch::Tensor& recv_topk_weights,
-                                               const torch::Tensor& recv_src_metadata,
-                                               const torch::Tensor& recv_expert_count,
-                                               const int& num_tokens_per_rank,
-                                               const int& rank_idx,
-                                               const int& num_experts,
-                                               const int& num_sms) {
+static void l4_grouped_unpack_fp8_dispatch_range_out(const torch::Tensor& recv_buffer,
+                                                     const torch::Tensor& recv_rank_prefix,
+                                                     const torch::Tensor& recv_x,
+                                                     const torch::Tensor& recv_sf,
+                                                     const torch::Tensor& recv_topk_idx,
+                                                     const torch::Tensor& recv_topk_weights,
+                                                     const torch::Tensor& recv_src_metadata,
+                                                     const torch::Tensor& recv_expert_count,
+                                                     const int& num_tokens_per_rank,
+                                                     const int& rank_idx,
+                                                     const int& num_experts,
+                                                     const int& start_recv_token,
+                                                     const int& num_unpack_tokens,
+                                                     const int& num_sms) {
     const int num_ranks = static_cast<int>(recv_rank_prefix.numel()) - 1;
     l4_grouped_check_fp8_dispatch_unpack_args(
         recv_buffer, recv_rank_prefix, recv_x, recv_sf, recv_topk_idx,
         recv_topk_weights, recv_src_metadata, recv_expert_count,
         num_tokens_per_rank, num_ranks, num_experts, num_sms);
     EP_HOST_ASSERT(rank_idx >= 0 and rank_idx < num_ranks);
+    EP_HOST_ASSERT(start_recv_token >= 0 and num_unpack_tokens >= 0);
+    EP_HOST_ASSERT(start_recv_token + num_unpack_tokens <= recv_x.size(0));
 
     constexpr int num_threads = 256;
     const int hidden_bytes = static_cast<int>(recv_x.size(1) * recv_x.element_size());
@@ -338,7 +344,8 @@ static void l4_grouped_unpack_fp8_dispatch_out(const torch::Tensor& recv_buffer,
         .recv_topk_weights = recv_topk_weights.data_ptr<float>(),
         .recv_src_metadata = recv_src_metadata.data_ptr<int>(),
         .recv_expert_count = recv_expert_count.data_ptr<int>(),
-        .num_recv_tokens = static_cast<int>(recv_x.size(0)),
+        .start_recv_token = start_recv_token,
+        .num_unpack_tokens = num_unpack_tokens,
         .num_tokens_per_rank = num_tokens_per_rank,
         .rank_idx = rank_idx,
         .num_experts = num_experts,
@@ -346,6 +353,25 @@ static void l4_grouped_unpack_fp8_dispatch_out(const torch::Tensor& recv_buffer,
     const auto code = L4GroupedUnpackFP8DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("l4_grouped_unpack_fp8_dispatch", code);
     L4GroupedUnpackFP8DispatchRuntime::launch(runtime, args, at::cuda::getCurrentCUDAStream());
+}
+
+static void l4_grouped_unpack_fp8_dispatch_out(const torch::Tensor& recv_buffer,
+                                               const torch::Tensor& recv_rank_prefix,
+                                               const torch::Tensor& recv_x,
+                                               const torch::Tensor& recv_sf,
+                                               const torch::Tensor& recv_topk_idx,
+                                               const torch::Tensor& recv_topk_weights,
+                                               const torch::Tensor& recv_src_metadata,
+                                               const torch::Tensor& recv_expert_count,
+                                               const int& num_tokens_per_rank,
+                                               const int& rank_idx,
+                                               const int& num_experts,
+                                               const int& num_sms) {
+    l4_grouped_unpack_fp8_dispatch_range_out(
+        recv_buffer, recv_rank_prefix, recv_x, recv_sf, recv_topk_idx,
+        recv_topk_weights, recv_src_metadata, recv_expert_count,
+        num_tokens_per_rank, rank_idx, num_experts,
+        0, static_cast<int>(recv_x.size(0)), num_sms);
 }
 
 }  // namespace deep_ep::elastic

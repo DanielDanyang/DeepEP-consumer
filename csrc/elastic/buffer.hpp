@@ -471,6 +471,19 @@ public:
     torch::Tensor l4_p2p_all_to_all_by_bytes(const torch::Tensor& send,
                                              const int64_t& bytes_per_peer_capacity,
                                              const std::vector<int64_t>& bytes_per_peer) const {
+        return l4_p2p_all_to_all_by_bytes_at_offsets(
+            send, bytes_per_peer_capacity,
+            std::vector<int64_t>(nccl_context->num_ranks, 0),
+            bytes_per_peer, comm_stream, true, true);
+    }
+
+    torch::Tensor l4_p2p_all_to_all_by_bytes_at_offsets(const torch::Tensor& send,
+                                                        const int64_t& bytes_per_peer_capacity,
+                                                        const std::vector<int64_t>& offsets_per_peer,
+                                                        const std::vector<int64_t>& bytes_per_peer,
+                                                        const at::cuda::CUDAStream& stream,
+                                                        const bool& wait_current_stream,
+                                                        const bool& wait_back_current_stream) const {
         EP_HOST_ASSERT(not agrs_in_session and "Do not mix the L4 grouped-P2P microbench with AGRS sessions");
         EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and "This prototype only targets single-node scale-up");
         EP_HOST_ASSERT(send.is_cuda() and send.is_contiguous());
@@ -478,17 +491,24 @@ public:
         EP_HOST_ASSERT(bytes_per_peer_capacity > 0 and bytes_per_peer_capacity % 32 == 0);
 
         const int num_ranks = nccl_context->num_ranks;
+        EP_HOST_ASSERT(static_cast<int>(offsets_per_peer.size()) == num_ranks);
         EP_HOST_ASSERT(static_cast<int>(bytes_per_peer.size()) == num_ranks);
         const int64_t required_bytes = bytes_per_peer_capacity * num_ranks;
         EP_HOST_ASSERT(send.nbytes() >= required_bytes);
         EP_HOST_ASSERT(required_bytes <= num_buffer_bytes);
-        for (const auto& num_bytes: bytes_per_peer) {
+        for (int i = 0; i < num_ranks; ++ i) {
+            const auto offset = offsets_per_peer[i];
+            const auto num_bytes = bytes_per_peer[i];
+            EP_HOST_ASSERT(offset >= 0 and offset <= bytes_per_peer_capacity);
             EP_HOST_ASSERT(num_bytes >= 0 and num_bytes <= bytes_per_peer_capacity);
+            EP_HOST_ASSERT(offset + num_bytes <= bytes_per_peer_capacity);
+            EP_HOST_ASSERT(offset % 32 == 0);
             EP_HOST_ASSERT(num_bytes % 32 == 0);
         }
 
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
-        stream_wait(comm_stream, compute_stream);
+        if (wait_current_stream and stream.id() != compute_stream.id())
+            stream_wait(stream, compute_stream);
 
         // Receiver layout is `[src_rank, bytes_per_peer]`. Each rank copies
         // only the segment meant for a given destination rank, avoiding the
@@ -503,14 +523,14 @@ public:
         for (int dst_rank_idx = 0; dst_rank_idx < num_ranks; ++dst_rank_idx) {
             if (bytes_per_peer[dst_rank_idx] == 0)
                 continue;
-            auto src_ptr = math::advance_ptr(send.data_ptr(), bytes_per_peer_capacity * dst_rank_idx);
+            auto src_ptr = math::advance_ptr(send.data_ptr(), bytes_per_peer_capacity * dst_rank_idx + offsets_per_peer[dst_rank_idx]);
             auto dst_ptr = nccl_context->get_sym_ptr(
-                math::advance_ptr(buffer, bytes_per_peer_capacity * nccl_context->rank_idx),
+                math::advance_ptr(buffer, bytes_per_peer_capacity * nccl_context->rank_idx + offsets_per_peer[dst_rank_idx]),
                 dst_rank_idx);
             if (dst_rank_idx == nccl_context->rank_idx) {
                 CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
                     dst_ptr, src_ptr, bytes_per_peer[dst_rank_idx],
-                    cudaMemcpyDeviceToDevice, comm_stream));
+                    cudaMemcpyDeviceToDevice, stream));
             } else {
                 src_ptrs[copy_idx] = src_ptr;
                 dst_ptrs[copy_idx] = dst_ptr;
@@ -525,9 +545,9 @@ public:
                 .flags = cudaMemcpyFlagPreferOverlapWithCompute
             };
 #if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
-            CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_copies, attrs, comm_stream));
+            CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_copies, attrs, stream));
 #else
-            CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_copies, attrs, nullptr, comm_stream));
+            CUDA_RUNTIME_CHECK(cudaMemcpyBatchAsync(dst_ptrs.data(), src_ptrs.data(), sizes.data(), num_copies, attrs, nullptr, stream));
 #endif
         }
 
@@ -542,9 +562,9 @@ public:
                        nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                        num_gpu_timeout_cycles,
                        nccl_context->is_scaleup_nvlink,
-                       comm_stream);
-        if (comm_stream.id() != compute_stream.id())
-            stream_wait(compute_stream, comm_stream);
+                       stream);
+        if (wait_back_current_stream and stream.id() != compute_stream.id())
+            stream_wait(compute_stream, stream);
 
         return torch::from_blob(
             buffer,
@@ -1082,8 +1102,6 @@ public:
             }
             const int num_recv_tokens = recv_prefix[num_ranks];
 
-            auto recv_buffer = l4_p2p_all_to_all_by_bytes(packed, bytes_per_peer_capacity, send_bytes_per_peer);
-
             auto recv_rank_prefix = torch::empty(
                 {num_ranks + 1}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
             CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
@@ -1106,11 +1124,62 @@ public:
             auto recv_expert_count = torch::empty(
                 {num_local_experts}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
 
-            l4_grouped_unpack_fp8_dispatch_out(
-                recv_buffer, recv_rank_prefix,
-                recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
-                recv_src_metadata, recv_expert_count,
-                num_max_tokens_per_rank, rank_idx, num_experts, num_sms);
+            // L4 PCIe P2P copies and unpack kernels use different engines, so chunking lets the
+            // next payload copy overlap the previous unpack. Eight chunks is the measured sweet
+            // spot for the fixed 8192x7168 top-8 FP8 dispatch target on 4xL4; the env override
+            // keeps the path easy to retune for other PCIe topologies or payload sizes.
+            const int num_l4_chunks = std::max(1, get_env<int>("EP_L4_GROUPED_NUM_CHUNKS", 8));
+            auto recv_buffer = torch::from_blob(
+                buffer,
+                {num_ranks, bytes_per_peer_capacity},
+                torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
+            if (num_l4_chunks == 1) {
+                recv_buffer = l4_p2p_all_to_all_by_bytes(packed, bytes_per_peer_capacity, send_bytes_per_peer);
+                l4_grouped_unpack_fp8_dispatch_out(
+                    recv_buffer, recv_rank_prefix,
+                    recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
+                    recv_src_metadata, recv_expert_count,
+                    num_max_tokens_per_rank, rank_idx, num_experts, num_sms);
+            } else {
+                const auto copy_stream = at::cuda::getStreamFromPool(true);
+                stream_wait(copy_stream, comm_stream);
+                for (int chunk_idx = 0; chunk_idx < num_l4_chunks; ++ chunk_idx) {
+                    const int token_begin = math::ceil_div(num_max_tokens_per_rank * chunk_idx, num_l4_chunks);
+                    const int token_end = math::ceil_div(num_max_tokens_per_rank * (chunk_idx + 1), num_l4_chunks);
+                    const int64_t byte_begin = static_cast<int64_t>(token_begin) * token_bytes;
+                    const int64_t byte_end = static_cast<int64_t>(token_end) * token_bytes;
+                    std::vector<int64_t> chunk_offsets(num_ranks, byte_begin);
+                    std::vector<int64_t> chunk_bytes(num_ranks, 0);
+                    for (int peer_idx = 0; peer_idx < num_ranks; ++ peer_idx) {
+                        const int peer_count = (peer_idx == rank_idx) ? recv_counts[peer_idx] : send_counts[peer_idx];
+                        const int peer_chunk_begin = std::min(token_begin, peer_count);
+                        const int peer_chunk_end = std::min(token_end, peer_count);
+                        chunk_offsets[peer_idx] = static_cast<int64_t>(peer_chunk_begin) * token_bytes;
+                        chunk_bytes[peer_idx] = static_cast<int64_t>(peer_chunk_end - peer_chunk_begin) * token_bytes;
+                    }
+
+                    l4_p2p_all_to_all_by_bytes_at_offsets(
+                        packed, bytes_per_peer_capacity, chunk_offsets, chunk_bytes,
+                        copy_stream, false, false);
+                    stream_wait(comm_stream, copy_stream);
+
+                    for (int src_rank_idx = 0; src_rank_idx < num_ranks; ++ src_rank_idx) {
+                        const int src_count = recv_counts[src_rank_idx];
+                        const int src_chunk_begin = std::min(token_begin, src_count);
+                        const int src_chunk_end = std::min(token_end, src_count);
+                        if (src_chunk_end <= src_chunk_begin)
+                            continue;
+                        const int start_recv_token = recv_prefix[src_rank_idx] + src_chunk_begin;
+                        const int num_unpack_tokens = src_chunk_end - src_chunk_begin;
+                        l4_grouped_unpack_fp8_dispatch_range_out(
+                            recv_buffer, recv_rank_prefix,
+                            recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
+                            recv_src_metadata, recv_expert_count,
+                            num_max_tokens_per_rank, rank_idx, num_experts,
+                            start_recv_token, num_unpack_tokens, num_sms);
+                    }
+                }
+            }
 
             std::vector<int> psum_num_recv_tokens_per_expert_host(num_local_experts);
             int running_expert_count = 0;

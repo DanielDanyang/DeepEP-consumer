@@ -117,7 +117,8 @@ __global__ void l4_grouped_unpack_fp8_dispatch_impl(
     float* recv_topk_weights,
     int* recv_src_metadata,
     int* recv_expert_count,
-    const int num_recv_tokens,
+    const int start_recv_token,
+    const int num_unpack_tokens,
     const int num_tokens_per_rank,
     const int rank_idx,
     const int num_experts) {
@@ -142,7 +143,8 @@ __global__ void l4_grouped_unpack_fp8_dispatch_impl(
     const int expert_start_idx = rank_idx * num_experts_per_rank;
     const int expert_end_idx = expert_start_idx + num_experts_per_rank;
 
-    for (int out_idx = global_warp_idx; out_idx < num_recv_tokens; out_idx += num_global_warps) {
+    for (int unpack_idx = global_warp_idx; unpack_idx < num_unpack_tokens; unpack_idx += num_global_warps) {
+        const int out_idx = start_recv_token + unpack_idx;
         int src_rank_idx = 0;
         #pragma unroll
         for (int rank_idx = 0; rank_idx < kNumRanks; ++rank_idx) {
