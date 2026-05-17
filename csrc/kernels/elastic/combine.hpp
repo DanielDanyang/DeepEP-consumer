@@ -133,6 +133,13 @@ static void* launch_combine(void* x,
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
+#if defined(DISABLE_SM90_FEATURES)
+    // On L4/SM89 the fallback path uses ordinary warp stores instead of TMA.
+    // With the fixed 10-SM target, one fewer warp per CTA improves peer-store
+    // scheduling; keep smaller-SM launches on the original occupancy choice.
+    if (num_sms >= 10)
+        num_warps = std::min(num_warps, 6);
+#endif
 
     // Decide warps
     int num_scaleup_warps = 0, num_forward_warps = 0;
