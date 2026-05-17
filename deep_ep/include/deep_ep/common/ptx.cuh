@@ -72,6 +72,20 @@ __forceinline__ __device__ void sync_copy_bytes_warp(void* dst_ptr, const void* 
     const auto active_rank = __popc(active_mask & ((1u << lane_idx) - 1));
     const auto active_count = __popc(active_mask);
 
+    // SM89 has no TMA fallback path, so large aligned token payloads are copied
+    // by ordinary warp stores.  Use 32-byte vectors when both endpoints and the
+    // payload size satisfy the token-layout alignment invariant; otherwise keep
+    // the older int4 path for generic callers.
+    if ((((reinterpret_cast<uintptr_t>(dst_ptr) | reinterpret_cast<uintptr_t>(src_ptr)) |
+          static_cast<uintptr_t>(num_bytes)) & (sizeof(longlong4_t) - 1)) == 0) {
+        auto dst_vec = reinterpret_cast<longlong4_t*>(dst_ptr);
+        const auto src_vec = reinterpret_cast<const longlong4_t*>(src_ptr);
+        const int num_vecs = num_bytes / static_cast<int>(sizeof(longlong4_t));
+        for (int i = active_rank; i < num_vecs; i += active_count)
+            dst_vec[i] = src_vec[i];
+        return;
+    }
+
     auto dst_vec = reinterpret_cast<int4*>(dst_ptr);
     const auto src_vec = reinterpret_cast<const int4*>(src_ptr);
     const int num_vecs = num_bytes / static_cast<int>(sizeof(int4));
