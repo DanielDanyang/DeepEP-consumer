@@ -4,7 +4,6 @@
 #include <memory>
 #include <vector>
 #include <pybind11/functional.h>
-#include <pybind11/stl.h>
 
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/compiled.cuh>
@@ -484,8 +483,8 @@ public:
                                                         const at::cuda::CUDAStream& stream,
                                                         const bool& wait_current_stream,
                                                         const bool& wait_back_current_stream) const {
-        EP_HOST_ASSERT(not agrs_in_session and "Do not mix the L4 grouped-P2P microbench with AGRS sessions");
-        EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and "This prototype only targets single-node scale-up");
+        EP_HOST_ASSERT(not agrs_in_session and "Do not mix the L4 grouped-P2P path with AGRS sessions");
+        EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and "The L4 grouped-P2P path only targets single-node scale-up");
         EP_HOST_ASSERT(send.is_cuda() and send.is_contiguous());
         EP_HOST_ASSERT(send.scalar_type() == torch::kByte);
         EP_HOST_ASSERT(bytes_per_peer_capacity > 0 and bytes_per_peer_capacity % 32 == 0);
@@ -1679,8 +1678,6 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_set_config", &ElasticBuffer::agrs_set_config)
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
-        .def("l4_p2p_all_to_all_fixed", &ElasticBuffer::l4_p2p_all_to_all_fixed)
-        .def("l4_p2p_all_to_all_by_bytes", &ElasticBuffer::l4_p2p_all_to_all_by_bytes)
         .def("dispatch", &ElasticBuffer::dispatch)
         .def("combine", &ElasticBuffer::combine);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
@@ -1694,16 +1691,6 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_physical_domain_size", &nccl::get_physical_domain_size);
     m.def("get_logical_domain_size", &nccl::get_logical_domain_size);
 
-    // Host-staging scale-out building blocks
-    m.def("host_staging_pack_fp8_dispatch", &host_staging_pack_fp8_dispatch);
-    m.def("host_staging_pack_fp8_dispatch_out", &host_staging_pack_fp8_dispatch_out);
-    m.def("host_staging_pack_bf16_combine", &host_staging_pack_bf16_combine);
-    m.def("host_staging_pack_bf16_combine_out", &host_staging_pack_bf16_combine_out);
-
-    // L4 grouped-P2P single-node prototype building blocks
-    m.def("l4_grouped_fp8_dispatch_token_bytes", &l4_grouped_fp8_dispatch_token_bytes);
-    m.def("l4_grouped_pack_fp8_dispatch_out", &l4_grouped_pack_fp8_dispatch_out);
-    m.def("l4_grouped_unpack_fp8_dispatch_out", &l4_grouped_unpack_fp8_dispatch_out);
 }
 
 }  // namespace deep_ep

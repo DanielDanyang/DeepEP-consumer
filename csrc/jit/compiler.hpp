@@ -76,9 +76,6 @@ public:
 #if defined(DISABLE_AGGRESSIVE_PTX_INSTRS)
         flags += " -DDISABLE_AGGRESSIVE_PTX_INSTRS";
 #endif
-#if defined(DISABLE_LEGACY_INTERNODE)
-        flags += " -DDISABLE_LEGACY_INTERNODE";
-#endif
 
         // Some special flags for EP
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
